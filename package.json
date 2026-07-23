@@ -1,14 +1,15 @@
 {
-  "name": "gramjs-telegram-bot",
-  "version": "1.0.0",
+  "name": "gramjs-bot",
+  "version": "2.0.0",
+  "description": "Telegram userbot with multi-provider LLM agent + no-prefix automation commands.",
   "main": "gramjs-bot.js",
   "scripts": {
     "start": "node gramjs-bot.js",
+    "smoke": "GRAMJS_BOT_EXPORT=1 node -e \"require('./gramjs-bot.js')\"",
     "login": "node gramjs-login.js"
   },
   "dependencies": {
-    "teleproto": "^1.225.3",
-    "input": "^1.0.1",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "archiver": "^7.0.1"
   }
 }
