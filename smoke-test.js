@@ -5,33 +5,21 @@
 const path = require('path');
 const fs = require('fs');
 
-// Mock teleproto so requiring the bot doesn't fail
+// Smoke test: install teleproto and dotenv into a local node_modules, then
+// require the real packages. This way we exercise the same require graph
+// that Render will use.
 const Module = require('module');
 const origResolve = Module._resolveFilename;
-Module._resolveFilename = function (request, parent, ...rest) {
-  if (request === 'teleproto' || request === 'teleproto/sessions' || request === 'teleproto/events') {
-    return path.join(__dirname, 'node_modules', '__teleproto_stub.js');
-  }
-  return origResolve.call(this, request, parent, ...rest);
-};
+const { execSync } = require('child_process');
+const nm = path.join(__dirname, 'node_modules');
+fs.mkdirSync(nm, { recursive: true });
 
-// Ensure stub dir
-fs.mkdirSync(path.join(__dirname, 'node_modules'), { recursive: true });
-if (!fs.existsSync(path.join(__dirname, 'node_modules', '__teleproto_stub.js'))) {
-  fs.writeFileSync(path.join(__dirname, 'node_modules', '__teleproto_stub.js'), `
-    class TelegramClient { constructor(){} async connect(){} async getMe(){ return {id:1,username:'test'}; } async sendMessage(){} async getMessages(){return [];} async invoke(){} addEventHandler(){} }
-    class StringSession { constructor(){} }
-    const Api = new Proxy({}, { get: () => class { constructor(o){Object.assign(this,o||{});} } });
-    const utils = {};
-    module.exports = { TelegramClient, Api, utils, default: { TelegramClient, Api } };
-  `);
-  fs.writeFileSync(path.join(__dirname, 'node_modules', '__teleproto_stub_events.js'), `
-    class NewMessage { constructor(){} }
-    class MessageDeleted { constructor(){} }
-    class MessageEdited { constructor(){} }
-    class MessageService { constructor(){} }
-    module.exports = { NewMessage, MessageDeleted, MessageEdited, MessageService };
-  `);
+// Make teleproto resolvable: install on first run only
+try { require.resolve('teleproto'); }
+catch {
+  console.log('Installing teleproto for smoke test...');
+  try { execSync('npm install --no-audit --no-fund teleproto dotenv archiver', { cwd: __dirname, stdio: 'inherit' }); }
+  catch (e) { console.error('install failed:', e.message); process.exit(1); }
 }
 
 // Set minimal env
