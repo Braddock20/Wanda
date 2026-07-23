@@ -20,6 +20,8 @@ npm install
 npm start
 ```
 
+`teleproto` is a TypeScript fork of `gramjs`, available on the public npm registry as `teleproto@1.228.x` — no private registry or vendored copy required.
+
 `SESSION_STRING` is loaded from `.env` or from a `.session` file. If neither exists, run `gramjs-login.js` locally first to generate one.
 
 ---
