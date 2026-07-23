@@ -1,92 +1,143 @@
-# Telegram bot (teleproto) — setup & deploy
+# gramjs-bot v2 — automation-first Telegram userbot
 
-A GramJS-style bot that logs in as a real Telegram account (not the official Bot API),
-built on `teleproto`, the actively maintained fork of the now-archived GramJS.
+A Termux-friendly Telegram userbot with:
+- **Multi-provider LLM agent loop** (Gemini, Groq, OpenRouter, Cerebras, OpenAI, GitHub Models, or any OpenAI-compatible endpoint) with automatic 429/5xx failover.
+- **No-prefix automation engine** — 14 automations that run without AI, on every chat you configure.
+- **AI mode toggle** (`on | off | hybrid`) — keep your admin commands alive even with the LLM off.
+- **Plugin-style modules** — drop a new file in to add an automation.
 
-## 1. Local setup (Termux or any machine)
+This is the v2 rewrite of `gramjs-bot-2.js`. Your original AI loop, tool schemas, and provider failover are preserved verbatim. The new automation engine sits as a thin layer on top.
 
-```bash
-cd gramjs-bot
-npm install --omit=optional
-```
+---
 
-`--omit=optional` skips native performance modules (utf-8-validate/bufferutil) that
-fail to compile on Termux — everything still works, just pure-JS websocket parsing.
-
-## 2. Get API credentials
-
-Go to https://my.telegram.org → log in → "API development tools" → create an app.
-You'll get an `API_ID` and `API_HASH`.
+## Setup
 
 ```bash
 cp .env.example .env
-# then edit .env and paste in your real API_ID and API_HASH
-```
-
-## 3. Generate a session (one-time, interactive)
-
-```bash
-node gramjs-login.js
-```
-
-Prompts:
-- Phone number (with country code, e.g. `+2547...`)
-- 2FA password (press enter to skip if you don't have one)
-- Code — sent as a message inside Telegram itself (check Saved Messages), not SMS
-
-This writes a `.session` file. Treat it like a password — never commit or share it.
-
-## 4. Test locally
-
-```bash
+# edit .env: API_ID, API_HASH, SESSION_STRING (or run gramjs-login.js),
+# AGENT_ADMIN_IDS, AUTOMATIONS, AI_MODE
+npm install
 npm start
 ```
 
-DM your account "ping" from another account/device — it should reply "pong".
-Ctrl+C to stop.
+`SESSION_STRING` is loaded from `.env` or from a `.session` file. If neither exists, run `gramjs-login.js` locally first to generate one.
 
-## 5. Push to GitHub
+---
 
-```bash
-git init
-git add .
-git commit -m "Initial commit"
-git branch -M main
-git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO.git
-git push -u origin main
+## AI mode
+
+`AI_MODE` in `.env` (or set live with `mode on|off|hybrid`):
+
+| Mode     | Slash / no-prefix commands | DMs (LLM agent) | Automations |
+|----------|----------------------------|------------------|-------------|
+| `on`     | ✅                         | ✅               | ✅          |
+| `off`    | ✅                         | ❌ (auto-reply: "AI off, use a command") | ✅ |
+| `hybrid` *(default)* | ✅           | ✅               | ✅          |
+
+When AI is off, automations and commands still work — you just don't burn tokens on free-form DMs.
+
+---
+
+## Automation commands
+
+**Admins can use them WITHOUT a prefix.** Slash and dot also work. Examples:
+
+```
+autolike on
+autolike emojis ❤️ 🔥 💯
+autoreact on
+autoreact add "deploy|ship" 🚀 🎉
+autopost on
+autopost target me
+autopost add @somechannel
+autopost run
+autosave on
+antidel on
+antiedit on
+autoreply on
+autoreply add "ping" "pong"
+autopurge on
+autopurge 60
+autoread on
+autobio on
+autobio add "chilling"
+antiraid on
+antiraid threshold 5
+scheduler on
+scheduler add "0 9 * * *" me "good morning"
+zipchannel @mychannel 50
+mode off
 ```
 
-`.gitignore` already excludes `node_modules`, `.env`, and `.session`.
+Get the full list any time with `automations` (or `/automations`).
 
-## 6. Get your session string for Render
+---
 
-```bash
-cat .session
+## What each automation does
+
+| Automation   | Default | What it does |
+|--------------|---------|--------------|
+| `autolike`   | off     | React to every message in configured chats with a random emoji from your emoji list. |
+| `autoreact`  | off     | Keyword/regex-driven reactions. Multiple emojis per rule → picks one at random. Default rules for greetings, love, fire, lol. |
+| `autopost`   | off     | Mirror posts from source channels to a target chat (Saved Messages, group, anywhere). Works live (new posts auto-forwarded) and on-demand (`autopost run`). |
+| `autosave`   | off     | Auto-download all media from configured chats to `./downloads/autosave/<chat>/`. |
+| `antidel`    | off     | Cache the last 1000 messages (text + media). On delete, recover the body and forward it to your Saved Messages. |
+| `antiedit`   | off     | Log every edited message with the previous version. |
+| `autoreply`  | off     | Canned keyword replies. No AI. |
+| `autoforward`| off     | Forward matching messages from source chats to a target chat. |
+| `autopurge`  | off     | Auto-delete your own messages after N seconds. |
+| `autoread`   | off     | Mark messages as read automatically. |
+| `autotyping` | off     | Show "typing…" in configured chats whenever a message arrives. |
+| `autobio`    | off     | Rotate your bio from a pool of strings on a timer. |
+| `antiraid`   | off     | Detect mass joins in groups. Log or auto-leave. |
+| `scheduler`  | off     | Cron-like recurring posts. Format: `min hour dom mon dow`. |
+| `zipchannel`| on      | `zipchannel @channel 50` → download 50 media, zip them, send the zip to your Saved Messages. |
+
+---
+
+## Configuration
+
+`AUTOMATIONS` in `.env` is a JSON object. Anything you omit uses the default. Example:
+
+```json
+{
+  "autolike":  { "enabled": true, "emojis": ["❤️","🔥","👍"] },
+  "autoreact": { "enabled": true, "rules": [{"match":"deploy","emojis":["🚀","💯"]}] },
+  "antidel":   { "enabled": true, "saveMedia": true },
+  "scheduler": { "enabled": true, "tasks": [{"cron":"0 9 * * *","chat":"me","text":"gm"}] }
+}
 ```
 
-Copy the full output — this is `SESSION_STRING`.
+Per-automation config keys are listed under each module in `automation-engine.js`.
 
-## 7. Deploy on Render
+---
 
-- render.com → New → **Web Service** → connect your GitHub repo
-- Build command: `npm install --omit=optional`
-- Start command: `npm start`
-- Environment variables:
-  - `API_ID`
-  - `API_HASH`
-  - `SESSION_STRING` (paste the string from step 6)
-- Deploy
+## Differences from `gramjs-bot-2.js`
 
-## 8. Keep it alive on the free tier (optional)
+- **Event coverage**: now listens in **all chats** (DMs, groups, channels) for automations. AI agent still only runs in DMs (original behavior).
+- **New event types**: `MessageDeleted` (antidel), `MessageEdited` (antiedit), `MessageService` (antiraid).
+- **No-prefix admin commands**: type `autolike on` without a slash — it just works.
+- **`mode` command**: live AI toggle. Persists in memory; set `AI_MODE` in `.env` to persist across restarts.
+- **`zipchannel`**: drop-in extractor for channel media.
+- **Same LLM logic**: same failover, same 27 native Telegram tools, same tool schemas.
 
-Free Web Services spin down after 15 min idle. Add your Render URL to
-UptimeRobot or cron-job.org, pinging every ~10 min, to keep the connection alive.
-Or upgrade to Starter (~$7/mo) to remove spin-down entirely — no code changes needed.
+---
 
 ## Notes
 
-- `.session` and `.env` are full account credentials — anyone with the session
-  string has complete access to the Telegram account, no password or 2FA needed.
-  Never commit them, paste them into a website, or share them.
-- The `ping` → `pong` block in `gramjs-bot.js` is a placeholder — swap it for a
-  Gemini call to make it a real auto-reply bot.
+- Telegram doesn't have a public "story" API for non-Premium users, so `autopost` mirrors to Saved Messages or any chat you choose — the closest non-Premium equivalent.
+- Telegram doesn't have user "statuses" you can react to, so "autolike statuses" maps to `autoread` (marks all dialogs as read) which is the equivalent social signal.
+- `antidel` and `antiedit` keep a small in-memory cache. For long-term recovery, the deleted-message bodies get written to `antidel-cache/`.
+- All admin-only write actions (sending, reacting, posting, pinning, forwarding) are still gated by `AGENT_ADMIN_IDS` for the LLM tools. Automation commands that trigger writes (`autopost`, `autoforward`, `autopurge`, `scheduler`) require the sender to be in `AGENT_ADMIN_IDS` too.
+
+---
+
+## Files
+
+```
+gramjs-bot.js          — main bot (LLM + automation dispatcher)
+automation-engine.js   — 14 automation modules, no AI required
+.env.example           — config template
+smoke-test.js          — unit tests (run: node smoke-test.js)
+package.json
+```
