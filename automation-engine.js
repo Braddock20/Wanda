@@ -674,31 +674,30 @@ const antiraid = {
   joinLog: new Map(), // chatId -> [timestamps]
   init(ctx) {
     return {
-      onService: async (msg) => {
+      onService: async (event) => {
         const cfg = ctx.automations.antiraid;
         if (!cfg?.enabled) return;
-        // Service messages about new members
-        if (msg.action?.className?.startsWith('MessageActionChatAddUser') || msg.action?.className === 'MessageActionChatJoinedByLink') {
-          const chatId = String(msg.chatId);
-          const now = Date.now();
-          const window = (cfg.windowSeconds || 10) * 1000;
-          const log = this.joinLog.get(chatId) || [];
-          log.push(now);
-          // Trim to window
-          while (log.length && now - log[0] > window) log.shift();
-          this.joinLog.set(chatId, log);
-          if (log.length >= (cfg.joinThreshold || 5)) {
-            ctx.log(`antiraid: ${log.length} joins in ${cfg.windowSeconds}s in ${chatId}`);
-            if (cfg.action === 'leave' && msg.chatId) {
-              try {
-                await ctx.client.invoke(new ctx.Api.messages.DeleteChat({ chatId: msg.chatId }));
-                ctx.log(`antiraid: left chat ${chatId}`);
-              } catch (e) {
-                ctx.log(`antiraid: leave failed: ${e.message}`);
-              }
+        // teleproto ChatAction event: has userJoined / userAdded flags and an actionMessage (MessageService)
+        if (!event.userJoined && !event.userAdded) return;
+        const chatId = event.actionMessage?.chatId ? String(event.actionMessage.chatId) : null;
+        if (!chatId) return;
+        const now = Date.now();
+        const window = (cfg.windowSeconds || 10) * 1000;
+        const log = this.joinLog.get(chatId) || [];
+        log.push(now);
+        while (log.length && now - log[0] > window) log.shift();
+        this.joinLog.set(chatId, log);
+        if (log.length >= (cfg.joinThreshold || 5)) {
+          ctx.log(`antiraid: ${log.length} joins in ${cfg.windowSeconds}s in ${chatId}`);
+          if (cfg.action === 'leave') {
+            try {
+              await ctx.client.invoke(new ctx.Api.messages.DeleteChat({ chatId: event.actionMessage.chatId }));
+              ctx.log(`antiraid: left chat ${chatId}`);
+            } catch (e) {
+              ctx.log(`antiraid: leave failed: ${e.message}`);
             }
-            this.joinLog.set(chatId, []);
           }
+          this.joinLog.set(chatId, []);
         }
       },
     };
