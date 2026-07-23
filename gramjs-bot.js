@@ -19,7 +19,7 @@ const fs = require('fs');
 const path = require('path');
 const { TelegramClient, Api, utils } = require('teleproto');
 const { StringSession } = require('teleproto/sessions');
-const { NewMessage, MessageDeleted, MessageEdited } = require('teleproto/events');
+const { NewMessage, DeletedMessage, EditedMessage, ChatAction } = require('teleproto/events');
 
 const engine = require('./automation-engine');
 
@@ -920,12 +920,29 @@ async function handleMessage(client, msg) {
 }
 
 async function handleDelete(client, event) {
-  // teleproto MessageDeleted event: { deletedIds, channelId?, messages? }
-  const chatId = String(event.channelId || (event.messages?.[0]?.chatId) || '');
-  const ids = event.deletedIds || (event.messages || []).map((m) => m.id);
-  if (!chatId || !ids?.length) return;
-  const entries = ids.map((id) => ({ chatId, msgId: id }));
-  await runAutomationsOnDelete(entries);
+  // teleproto DeletedMessage event: { deletedIds: number[], peer?: EntityLike, isChannel?: boolean }
+  // For private chats, Telegram doesn't tell us which chat — so we scan the antidel cache.
+  const ids = event.deletedIds || [];
+  if (!ids.length) return;
+  const peerId = event.peer ? (event.peer.userId || event.peer.chatId || event.peer.channelId) : null;
+  const entries = [];
+
+  if (peerId) {
+    // Channel/supergroup case: peer is known
+    for (const id of ids) entries.push({ chatId: String(peerId), msgId: id });
+  } else {
+    // Private chat case: scan antidel cache by message ID (unique in DMs)
+    const cache = engine._modules.antidel.recentCache;
+    for (const id of ids) {
+      for (const [key, val] of cache.entries()) {
+        if (val?.msg?.id === id) {
+          entries.push({ chatId: val.msg.chatId, msgId: id });
+          break;
+        }
+      }
+    }
+  }
+  if (entries.length) await runAutomationsOnDelete(entries);
 }
 
 async function handleEdit(client, event) {
@@ -934,8 +951,9 @@ async function handleEdit(client, event) {
 }
 
 async function handleService(client, event) {
-  if (!event.message) return;
-  await runAutomationsOnService(event.message);
+  // teleproto ChatAction event: { actionMessage?: Api.MessageService, userJoined, userAdded, ... }
+  // We pass event through; automations read what they need.
+  await runAutomationsOnService(event);
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -973,24 +991,23 @@ async function start() {
 
   // Service messages (joins, leaves, etc.) — needed for antiraid
   try {
-    const { MessageService } = require('teleproto/events');
-    client.addEventHandler((event) => handleService(client, event), new MessageService({}));
+    client.addEventHandler((event) => handleService(client, event), new ChatAction({}));
   } catch (e) {
-    ctx.log('MessageService event not available:', e.message);
+    ctx.log('ChatAction event not available:', e.message);
   }
 
   // Deletions — for antidel
   try {
-    client.addEventHandler((event) => handleDelete(client, event), new MessageDeleted({}));
+    client.addEventHandler((event) => handleDelete(client, event), new DeletedMessage({}));
   } catch (e) {
-    ctx.log('MessageDeleted event not available:', e.message);
+    ctx.log('DeletedMessage event not available:', e.message);
   }
 
   // Edits — for antiedit
   try {
-    client.addEventHandler((event) => handleEdit(client, event), new MessageEdited({}));
+    client.addEventHandler((event) => handleEdit(client, event), new EditedMessage({}));
   } catch (e) {
-    ctx.log('MessageEdited event not available:', e.message);
+    ctx.log('EditedMessage event not available:', e.message);
   }
 
   console.log('Listening for messages...');
