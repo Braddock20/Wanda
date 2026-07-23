@@ -22,6 +22,29 @@ const { StringSession } = require('teleproto/sessions');
 const { NewMessage, DeletedMessage, EditedMessage, ChatAction } = require('teleproto/events');
 
 const engine = require('./automation-engine');
+const extras = require('./extras');
+
+// Register all v3 extras into the engine's trigger map so they participate
+// in no-prefix / slash command resolution and hybrid/chain dispatch.
+for (const [name, mod] of Object.entries(extras.EXTRA_COMMANDS)) {
+  const triggers = mod.command?.triggers || mod.triggers;
+  const handler = mod.command?.handler || mod.handler;
+  if (!triggers || !handler) continue;
+  // Normalize to engine's { command: { triggers, handler } } shape
+  if (!mod.command) mod.command = { triggers, handler };
+  // Expose as a synthetic automation so TRIGGER_MAP picks it up.
+  engine._modules[name] = { name, description: 'v3 extra', defaultCfg: {}, command: mod.command };
+  for (const t of triggers) {
+    engine.TRIGGER_MAP.set(t.toLowerCase(), engine._modules[name]);
+  }
+}
+// Inject the engine ref into extras so hybrid/chain can resolve sub-commands.
+for (const mod of Object.values(extras.EXTRA_COMMANDS)) {
+  if (typeof mod.handler === 'function') {
+    const orig = mod.handler;
+    mod.handler = async (ctx, args) => orig(ctx, args);
+  }
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 // Config
@@ -865,6 +888,32 @@ async function tryAutomationCommand(client, msg, isAdmin, text) {
   return null;
 }
 
+async function tryExtrasCommand(client, msg, isAdmin, text) {
+  // Try the v3 extras directly (so reply-context commands get `msg` in ctx).
+  // Uses the same engine resolveCommand so the trigger map covers everything.
+  const resolved = engine.resolveCommand(text);
+  if (!resolved) return null;
+  const trigger = engine.TRIGGER_MAP.get(resolved.name);
+  if (!trigger?.command) return null;
+  // Only run if the trigger came from extras (we marked them with description 'v3 extra')
+  if (trigger.description !== 'v3 extra') return null;
+  if (!isAdmin) return null;
+  try {
+    const reply = await trigger.command.handler(
+      { client, msg, Api, chatId: msg.chatId, automations, adminIds, channelConfig, downloadDir, aiMode, engine, log: ctx.log, _automationTimers: ctx._automationTimers },
+      resolved.args
+    );
+    if (reply != null) {
+      await client.sendMessage(msg.chatId, { message: String(reply), replyTo: msg.id });
+      return true;
+    }
+  } catch (e) {
+    await client.sendMessage(msg.chatId, { message: `error: ${e.message}`, replyTo: msg.id });
+    return true;
+  }
+  return null;
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Main message handler
 // ──────────────────────────────────────────────────────────────────────────
@@ -887,8 +936,11 @@ async function handleMessage(client, msg) {
   // Admins: any message matching a known automation command runs it, no prefix needed.
   // Slash commands work for everyone (built-ins go to runSlashBuiltin).
   if (isAdmin) {
-    const handled = await tryAutomationCommand(client, msg, isAdmin, text);
+    // v3 extras first (they have richer context — msg, Api, engine)
+    const handled = await tryExtrasCommand(client, msg, isAdmin, text);
     if (handled) return;
+    const handled2 = await tryAutomationCommand(client, msg, isAdmin, text);
+    if (handled2) return;
   }
 
   if (text.startsWith('/')) {
@@ -1013,25 +1065,30 @@ async function start() {
   console.log('Listening for messages...');
 }
 
-start().catch((err) => {
-  console.error('Failed to start, retrying in 5s:', err.message);
-  setTimeout(start, 5000);
-});
-
-http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Bot is running');
-}).listen(Number(process.env.PORT) || 3000, () => {
-  console.log(`Health server on :${process.env.PORT || 3000}`);
-});
-
-// Internal exports for testing
+// In test mode (GRAMJS_BOT_EXPORT=1), don't start the live bot — just export
+// pure helpers for the smoke test. This avoids noisy "Failed to start" logs
+// when CI imports the module with a fake SESSION_STRING.
 if (process.env.GRAMJS_BOT_EXPORT === '1') {
+  // Internal exports for testing
   module.exports = {
     parseWhen, ensureChannel, findChannelConfig, ALL_TOOL_NAMES,
     telegramToolSchemas, reminders, runSlashBuiltin, getHistory, resetHistory,
     execTelegramTool, providers, loadProviders, callProviderOnce, callModel,
     internalToProvider, providerToInternal,
-    engine, automations, ctx, aiMode,
+    engine, automations, ctx, aiMode, extras,
   };
+} else {
+  start().catch((err) => {
+    console.error('Failed to start, retrying in 5s:', err.message);
+    setTimeout(start, 5000);
+  });
+
+  http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Bot is running');
+  }).listen(Number(process.env.PORT) || 3000, () => {
+    console.log(`Health server on :${process.env.PORT || 3000}`);
+  });
 }
+
+// (live start + health server are inside the else branch above when not in test mode)
