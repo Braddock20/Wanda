@@ -1,0 +1,14 @@
+{
+  "name": "gramjs-telegram-bot",
+  "version": "1.0.0",
+  "main": "gramjs-bot.js",
+  "scripts": {
+    "start": "node gramjs-bot.js",
+    "login": "node gramjs-login.js"
+  },
+  "dependencies": {
+    "teleproto": "^1.225.3",
+    "input": "^1.0.1",
+    "dotenv": "^16.4.5"
+  }
+}
