@@ -1,12 +1,17 @@
-// gramjs-bot.js — Termux-friendly Telegram userbot with Gemini agent loop.
+// gramjs-bot.js — Termux-friendly Telegram userbot with a multi-provider LLM agent loop.
 //
 // What it does:
 //   - Logs into a real Telegram user account (teleproto / GramJS fork).
-//   - Listens for DMs; replies using Google Gemini with a tool-calling agent loop.
-//   - Exposes ~25 native Telegram tools (chat, search, channels, media, etc.)
+//   - Listens for DMs; replies using an LLM (Gemini, OpenAI, Groq, OpenRouter,
+//     Cerebras, GitHub Models, or any OpenAI-compatible endpoint) with a
+//     tool-calling agent loop.
+//   - Exposes ~27 native Telegram tools (chat, search, channels, media, etc.)
 //     plus any AGENT_TOOLS you define in .env.
 //   - Slash commands (/help, /tools, /reset, /ping, /whoami) are handled
 //     directly — no model cost.
+//   - Automatic failover: when a provider hits 429 (rate-limited) or 5xx, the
+//     next provider in the list takes over for that request. Pair with
+//     multiple free keys to multiply your effective quota.
 //
 // Safety:
 //   - Channel write actions are gated by AGENT_CHANNELS per-channel flags.
@@ -14,8 +19,7 @@
 //     be in AGENT_ADMIN_IDS.
 //   - Read-only tools (get_chat_history, list_channel_media, etc.) are
 //     available to anyone messaging the bot in a DM.
-//   - Tool errors are returned to Gemini instead of thrown, so the model
-//     can recover gracefully.
+//   - Tool errors are returned to the model instead of thrown, so it can recover.
 //
 // Setup: see README.md / .env.example.
 
@@ -33,12 +37,12 @@ const { NewMessage } = require('teleproto/events');
 
 const apiId = Number(process.env.API_ID);
 const apiHash = process.env.API_HASH;
-const geminiKey = process.env.GEMINI_API_KEY;
-const geminiModel = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const downloadDir = process.env.DOWNLOAD_DIR || path.join(__dirname, 'downloads');
 const maxVideoSeconds = Number(process.env.MAX_VIDEO_SECONDS || 60);
 const maxHistory = Number(process.env.MAX_HISTORY || 30);
 const maxAgentSteps = Number(process.env.MAX_AGENT_STEPS || 8);
+const maxRetriesPerRequest = Number(process.env.MAX_RETRIES || 3);
+const backoffBaseMs = Number(process.env.BACKOFF_BASE_MS || 2000);
 
 const systemPrompt =
   process.env.SYSTEM_PROMPT ||
@@ -75,10 +79,6 @@ if (!sessionString) {
   console.log('No session found. Run gramjs-login.js locally first.');
   process.exit(1);
 }
-if (!geminiKey) {
-  console.log('Missing GEMINI_API_KEY.');
-  process.exit(1);
-}
 if (!apiId || !apiHash) {
   console.log('Missing API_ID or API_HASH.');
   process.exit(1);
@@ -86,7 +86,99 @@ if (!apiId || !apiHash) {
 
 fs.mkdirSync(downloadDir, { recursive: true });
 
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent`;
+// ──────────────────────────────────────────────────────────────────────────
+// LLM Providers — ordered list, automatic failover on 429/5xx
+// ──────────────────────────────────────────────────────────────────────────
+//
+// Each provider is { name, baseUrl, apiKey, model, format }.
+//   format: 'openai'  — OpenAI-compatible /chat/completions (Groq, OpenRouter,
+//                       Cerebras, GitHub Models, llama.cpp, LM Studio, etc.)
+//   format: 'gemini'  — Google's generateContent endpoint
+//
+// Configure via env: AGENT_PROVIDERS as a JSON array (recommended for
+// multiple providers), OR set the GEMINI_API_KEY / OPENAI_API_KEY / GROQ_API_KEY
+// / OPENROUTER_API_KEY convenience vars to spin up single-provider configs.
+
+function loadProviders() {
+  // 1) Explicit JSON config wins.
+  if (process.env.AGENT_PROVIDERS) {
+    try {
+      const arr = JSON.parse(process.env.AGENT_PROVIDERS);
+      if (Array.isArray(arr) && arr.length) return arr;
+    } catch (err) {
+      console.error('AGENT_PROVIDERS is not valid JSON:', err.message);
+    }
+  }
+  // 2) Convenience single-provider shortcuts.
+  const shortcuts = [];
+  if (process.env.GEMINI_API_KEY) {
+    shortcuts.push({
+      name: 'gemini',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta/models',
+      apiKey: process.env.GEMINI_API_KEY,
+      model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+      format: 'gemini',
+    });
+  }
+  if (process.env.GROQ_API_KEY) {
+    shortcuts.push({
+      name: 'groq',
+      baseUrl: 'https://api.groq.com/openai/v1',
+      apiKey: process.env.GROQ_API_KEY,
+      model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+      format: 'openai',
+    });
+  }
+  if (process.env.OPENROUTER_API_KEY) {
+    shortcuts.push({
+      name: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: process.env.OPENROUTER_API_KEY,
+      model: process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free',
+      format: 'openai',
+    });
+  }
+  if (process.env.CEREBRAS_API_KEY) {
+    shortcuts.push({
+      name: 'cerebras',
+      baseUrl: 'https://api.cerebras.ai/v1',
+      apiKey: process.env.CEREBRAS_API_KEY,
+      model: process.env.CEREBRAS_MODEL || 'llama-3.3-70b',
+      format: 'openai',
+    });
+  }
+  if (process.env.OPENAI_API_KEY) {
+    shortcuts.push({
+      name: 'openai',
+      baseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
+      apiKey: process.env.OPENAI_API_KEY,
+      model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+      format: 'openai',
+    });
+  }
+  if (process.env.GITHUB_TOKEN) {
+    shortcuts.push({
+      name: 'github',
+      baseUrl: 'https://models.inference.ai.azure.com',
+      apiKey: process.env.GITHUB_TOKEN,
+      model: process.env.GITHUB_MODEL || 'gpt-4o',
+      format: 'openai',
+    });
+  }
+  return shortcuts;
+}
+
+const providers = loadProviders();
+if (!providers.length) {
+  console.log(
+    'No LLM provider configured. Set one of: GEMINI_API_KEY, GROQ_API_KEY, ' +
+      'OPENROUTER_API_KEY, CEREBRAS_API_KEY, OPENAI_API_KEY, GITHUB_TOKEN, ' +
+      'or AGENT_PROVIDERS as a JSON array.'
+  );
+  process.exit(1);
+}
+console.log('LLM providers (in order):', providers.map((p) => `${p.name}:${p.model}`).join(', '));
+
 const conversations = new Map();
 
 // Reminders: array of { fireAt: epochMs, chatId, text, timer }
@@ -94,7 +186,7 @@ const reminders = [];
 
 // ──────────────────────────────────────────────────────────────────────────
 // Conversation history
-// ─────────────────���────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────
 
 function getHistory(chatId) {
   if (!conversations.has(chatId)) conversations.set(chatId, []);
@@ -524,7 +616,6 @@ async function execTelegramTool(client, name, args, ctx) {
 
     // ── Utilities ──────────────────────────────────────────────────────
     case 'translate_text': {
-      // Uses Gemini itself — call back into callGeminiTranslate.
       return await translateText(args.text, args.target || 'en');
     }
 
@@ -611,37 +702,185 @@ function parseWhen(input) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Gemini helpers (translation/summarization reuse the same model)
+// Multi-provider LLM layer (Gemini + OpenAI-compatible endpoints)
 // ──────────────────────────────────────────────────────────────────────────
+//
+// Single internal representation: { system, messages, tools }
+//   messages: [{ role: 'user'|'assistant'|'tool', content?, tool_calls?, tool_call_id?, name? }]
+//   tools:    [{ name, description, parameters }]  (JSON Schema)
+//
+// Each provider has a `toRequest()` that converts the internal form to the
+// provider's wire format, and a `fromResponse()` that normalizes the
+// response back to { text?, toolCalls: [{name, args}]? }.
 
-async function callGeminiRaw(body) {
-  const res = await fetch(GEMINI_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`Gemini ${res.status}: ${txt.slice(0, 500)}`);
+function internalToProvider(provider, internal) {
+  if (provider.format === 'gemini') {
+    // Gemini uses "contents" with role user/model, plus system_instruction
+    // and a "tools" array of { functionDeclarations }.
+    const contents = [];
+    for (const m of internal.messages) {
+      if (m.role === 'tool') {
+        // Gemini expects a "functionResponse" part on a user turn.
+        contents.push({
+          role: 'user',
+          parts: [
+            {
+              functionResponse: {
+                name: m.name,
+                response: typeof m.content === 'string' ? safeJsonParse(m.content) : m.content,
+              },
+            },
+          ],
+        });
+      } else if (m.role === 'assistant') {
+        const parts = [];
+        if (m.content) parts.push({ text: m.content });
+        if (m.tool_calls?.length) {
+          for (const tc of m.tool_calls) {
+            parts.push({ functionCall: { name: tc.name, args: tc.args || {} } });
+          }
+        }
+        contents.push({ role: 'model', parts });
+      } else {
+        contents.push({ role: 'user', parts: [{ text: m.content || '' }] });
+      }
+    }
+    const body = { contents };
+    if (internal.system) body.system_instruction = { parts: [{ text: internal.system }] };
+    if (internal.tools?.length) body.tools = [{ functionDeclarations: internal.tools }];
+    return body;
   }
-  return res.json();
+  // OpenAI-compatible format
+  const messages = [];
+  if (internal.system) messages.push({ role: 'system', content: internal.system });
+  for (const m of internal.messages) {
+    if (m.role === 'tool') {
+      messages.push({
+        role: 'tool',
+        tool_call_id: m.tool_call_id,
+        name: m.name,
+        content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+      });
+    } else if (m.role === 'assistant') {
+      const msg = { role: 'assistant', content: m.content || null };
+      if (m.tool_calls?.length) {
+        msg.tool_calls = m.tool_calls.map((tc, i) => ({
+          id: tc.id || `call_${Date.now()}_${i}`,
+          type: 'function',
+          function: { name: tc.name, arguments: JSON.stringify(tc.args || {}) },
+        }));
+      }
+      messages.push(msg);
+    } else {
+      messages.push({ role: m.role, content: m.content || '' });
+    }
+  }
+  const body = { model: provider.model, messages };
+  if (internal.tools?.length) {
+    body.tools = internal.tools.map((t) => ({
+      type: 'function',
+      function: { name: t.name, description: t.description, parameters: t.parameters },
+    }));
+  }
+  return body;
+}
+
+function providerToInternal(provider, raw) {
+  if (provider.format === 'gemini') {
+    const parts = raw?.candidates?.[0]?.content?.parts || [];
+    let text = '';
+    const toolCalls = [];
+    for (const p of parts) {
+      if (p.text) text += p.text;
+      if (p.functionCall) {
+        toolCalls.push({ id: `call_${Date.now()}_${toolCalls.length}`, name: p.functionCall.name, args: p.functionCall.args || {} });
+      }
+    }
+    return { text: text.trim() || null, toolCalls };
+  }
+  // OpenAI-compatible
+  const choice = raw?.choices?.[0];
+  const msg = choice?.message || {};
+  const toolCalls = (msg.tool_calls || []).map((tc) => ({
+    id: tc.id,
+    name: tc.function?.name,
+    args: safeJsonParse(tc.function?.arguments) || {},
+  }));
+  return { text: msg.content || null, toolCalls };
+}
+
+function safeJsonParse(s) {
+  if (s == null) return null;
+  if (typeof s !== 'string') return s;
+  try { return JSON.parse(s); } catch { return { _raw: s }; }
+}
+
+async function callProviderOnce(provider, internal) {
+  const body = internalToProvider(provider, internal);
+  let url, headers;
+  if (provider.format === 'gemini') {
+    url = `${provider.baseUrl}/${provider.model}:generateContent`;
+    headers = { 'Content-Type': 'application/json', 'x-goog-api-key': provider.apiKey };
+  } else {
+    url = `${provider.baseUrl}/chat/completions`;
+    headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${provider.apiKey}` };
+  }
+  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+  const txt = await res.text();
+  if (!res.ok) {
+    const err = new Error(`${provider.name} ${res.status}: ${txt.slice(0, 500)}`);
+    err.status = res.status;
+    err.provider = provider.name;
+    throw err;
+  }
+  if (!txt) {
+    throw Object.assign(new Error(`${provider.name} returned empty response body`), { status: 502, provider: provider.name });
+  }
+  let parsed;
+  try { parsed = JSON.parse(txt); } catch (err) {
+    throw Object.assign(new Error(`${provider.name} returned non-JSON: ${txt.slice(0, 200)}`), { status: 502, provider: provider.name });
+  }
+  return providerToInternal(provider, parsed);
+}
+
+// Try providers in order, fall back on 429/5xx, with exponential backoff.
+async function callModel(internal) {
+  let lastErr;
+  for (const provider of providers) {
+    for (let attempt = 0; attempt < maxRetriesPerRequest; attempt++) {
+      try {
+        return await callProviderOnce(provider, internal);
+      } catch (err) {
+        lastErr = err;
+        const retryable = err.status === 429 || (err.status >= 500 && err.status < 600);
+        console.warn(`[${provider.name}] ${err.status || 'ERR'}: ${(err.message || '').slice(0, 200)}`);
+        if (!retryable) throw err; // 4xx other than 429 is a real client error, don't burn other providers
+        if (attempt < maxRetriesPerRequest - 1) {
+          const wait = backoffBaseMs * Math.pow(2, attempt);
+          await new Promise((r) => setTimeout(r, wait));
+        }
+      }
+    }
+    console.warn(`[${provider.name}] exhausted retries, falling through.`);
+  }
+  throw lastErr || new Error('All providers failed.');
+}
+
+// Plain text completion (no tools) for translate/summarize utilities.
+async function callModelPlain(prompt, systemOverride) {
+  const internal = {
+    system: systemOverride || 'You are a helpful assistant. Follow the user instructions exactly.',
+    messages: [{ role: 'user', content: prompt }],
+  };
+  const result = await callModel(internal);
+  return result.text || '';
 }
 
 async function translateText(text, target) {
   if (!text) return { error: 'text is required' };
-  const data = await callGeminiRaw({
-    contents: [
-      {
-        role: 'user',
-        parts: [
-          {
-            text: `Translate the following to ${target}. Return ONLY the translation, no preamble, no quotes.\n\n${text}`,
-          },
-        ],
-      },
-    ],
-  });
-  const out = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('').trim();
+  const out = await callModelPlain(
+    `Translate the following to ${target}. Return ONLY the translation, no preamble, no quotes.\n\n${text}`
+  );
   return { translation: out };
 }
 
@@ -650,10 +889,7 @@ async function summarizeText(text, focus) {
   const prompt = focus
     ? `Summarize the following chat messages, focusing on: ${focus}. Be concise.\n\n${text}`
     : `Summarize the following chat messages in 5-8 bullet points.\n\n${text}`;
-  const data = await callGeminiRaw({
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-  });
-  const out = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('').trim();
+  const out = await callModelPlain(prompt);
   return { summary: out };
 }
 
@@ -927,7 +1163,7 @@ const telegramToolSchemas = [
   // Utilities
   {
     name: 'translate_text',
-    description: 'Translate text into a target language using Gemini. target defaults to "en".',
+    description: 'Translate text into a target language using the configured LLM. target defaults to "en".',
     parameters: {
       type: 'object',
       properties: {
@@ -939,7 +1175,7 @@ const telegramToolSchemas = [
   },
   {
     name: 'summarize_chat',
-    description: 'Fetch recent messages from a chat and summarize them with Gemini.',
+    description: 'Fetch recent messages from a chat and summarize them with the configured LLM.',
     parameters: {
       type: 'object',
       properties: {
@@ -988,16 +1224,44 @@ const ALL_TOOL_NAMES = [
 ];
 
 // ──────────────────────────────────────────────────────────────────────────
-// Agent loop
+// Agent loop — provider-agnostic, talks in the internal representation.
 // ──────────────────────────────────────────────────────────────────────────
 
-async function callGemini(contents, availableTools) {
-  const body = {
-    system_instruction: { parts: [{ text: systemPrompt }] },
-    contents,
-  };
-  if (availableTools.length) body.tools = [{ functionDeclarations: availableTools }];
-  return callGeminiRaw(body);
+function historyToMessages(history) {
+  // history entries are { role, parts } (legacy Gemini shape we already
+  // store in the conversations Map). Normalize to the internal messages list.
+  const out = [];
+  for (const entry of history) {
+    if (entry.role === 'user') {
+      const text = (entry.parts || []).map((p) => p.text || '').join('');
+      const fr = (entry.parts || []).find((p) => p.functionResponse);
+      if (fr) {
+        out.push({
+          role: 'tool',
+          tool_call_id: fr.functionResponse.tool_call_id || `tr_${out.length}`,
+          name: fr.functionResponse.name,
+          content: JSON.stringify(fr.functionResponse.response || {}),
+        });
+      } else {
+        out.push({ role: 'user', content: text });
+      }
+    } else if (entry.role === 'model') {
+      const text = (entry.parts || []).map((p) => p.text || '').join('');
+      const fc = (entry.parts || []).find((p) => p.functionCall);
+      if (fc) {
+        out.push({
+          role: 'assistant',
+          content: text || null,
+          tool_calls: [
+            { id: `call_${out.length}_${Date.now()}`, name: fc.functionCall.name, args: fc.functionCall.args || {} },
+          ],
+        });
+      } else {
+        out.push({ role: 'assistant', content: text });
+      }
+    }
+  }
+  return out;
 }
 
 async function runAgent(client, ctx, userText) {
@@ -1005,55 +1269,62 @@ async function runAgent(client, ctx, userText) {
   const history = getHistory(chatId);
   history.push({ role: 'user', parts: [{ text: userText }] });
 
-  // Always-available tools + admin-only write tools.
   const availableTools = [
     ...telegramToolSchemas,
     ...httpTools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })),
   ];
 
   for (let step = 0; step < maxAgentSteps; step++) {
-    let data;
+    const internal = {
+      system: systemPrompt,
+      messages: historyToMessages(history),
+      tools: availableTools,
+    };
+
+    let result;
     try {
-      data = await callGemini(history, availableTools);
+      result = await callModel(internal);
     } catch (err) {
       return `Model error: ${err.message}`;
     }
 
-    const parts = data?.candidates?.[0]?.content?.parts || [];
-    const callPart = parts.find((p) => p.functionCall);
-
-    if (!callPart) {
-      const reply =
-        parts.map((p) => p.text || '').join('').trim() || "Hmm, didn't quite catch that.";
+    // No tool call — return the text reply.
+    if (!result.toolCalls?.length) {
+      const reply = result.text || "Hmm, didn't quite catch that.";
       history.push({ role: 'model', parts: [{ text: reply }] });
       trimHistory(history);
       return reply;
     }
 
-    history.push({ role: 'model', parts: [callPart] });
-    const { name, args } = callPart.functionCall || {};
-    if (!name) {
-      return 'Model returned an empty tool call.';
-    }
+    // One or more tool calls. For now, we honor the first; multi-call
+    // fan-out is rare in practice and most providers don't emit more than one.
+    const tc = result.toolCalls[0];
+    if (!tc.name) return 'Model returned an empty tool call.';
 
-    let result;
+    // Record the assistant turn in legacy history shape.
+    history.push({
+      role: 'model',
+      parts: [{ functionCall: { name: tc.name, args: tc.args || {} } }],
+    });
+
+    let execResult;
     try {
-      const isHttp = httpTools.some((t) => t.name === name);
+      const isHttp = httpTools.some((t) => t.name === tc.name);
       if (isHttp) {
-        const tool = httpTools.find((t) => t.name === name);
-        result = await callHttpTool(tool, args);
-      } else if (telegramToolSchemas.some((t) => t.name === name)) {
-        result = await execTelegramTool(client, name, args || {}, { isAdmin, senderId, chatId });
+        const tool = httpTools.find((t) => t.name === tc.name);
+        execResult = await callHttpTool(tool, tc.args);
+      } else if (telegramToolSchemas.some((t) => t.name === tc.name)) {
+        execResult = await execTelegramTool(client, tc.name, tc.args || {}, { isAdmin, senderId, chatId });
       } else {
-        result = { error: `Unknown tool: ${name}` };
+        execResult = { error: `Unknown tool: ${tc.name}` };
       }
     } catch (err) {
-      result = { error: err.message };
+      execResult = { error: err.message };
     }
 
     history.push({
       role: 'user',
-      parts: [{ functionResponse: { name, response: { result } } }],
+      parts: [{ functionResponse: { name: tc.name, response: { result: execResult }, tool_call_id: tc.id } }],
     });
     trimHistory(history);
   }
@@ -1144,7 +1415,7 @@ async function start() {
 
 // ──────────────────────────────────────────────────────────────────────────
 // Entry
-// ────────────────────────────────────────────────────────���─────────────────
+// ──────────────────────────────────────────────────────────────────────────
 
 start().catch((err) => {
   console.error('Failed to start, retrying in 5s:', err.message);
@@ -1173,5 +1444,11 @@ if (process.env.GRAMJS_BOT_EXPORT === '1') {
     getHistory,
     resetHistory,
     execTelegramTool,
+    providers,
+    loadProviders,
+    callProviderOnce,
+    callModel,
+    internalToProvider,
+    providerToInternal,
   };
 }
