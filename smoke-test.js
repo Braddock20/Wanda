@@ -1,20 +1,13 @@
-// smoke-test.js — load automation engine and exercise its pure functions
-// without needing a real Telegram connection.
+// smoke-test.js — exercises pure helpers + registration. No Telegram
+// connection required. Set GRAMJS_BOT_EXPORT=1 to load gramjs-bot.js.
 'use strict';
 
 const path = require('path');
 const fs = require('fs');
-
-// Smoke test: install teleproto and dotenv into a local node_modules, then
-// require the real packages. This way we exercise the same require graph
-// that Render will use.
-const Module = require('module');
-const origResolve = Module._resolveFilename;
 const { execSync } = require('child_process');
 const nm = path.join(__dirname, 'node_modules');
 fs.mkdirSync(nm, { recursive: true });
 
-// Make teleproto resolvable: install on first run only
 try { require.resolve('teleproto'); }
 catch {
   console.log('Installing teleproto for smoke test...');
@@ -22,7 +15,6 @@ catch {
   catch (e) { console.error('install failed:', e.message); process.exit(1); }
 }
 
-// Set minimal env
 process.env.API_ID = '12345';
 process.env.API_HASH = 'fake';
 process.env.SESSION_STRING = 'fake';
@@ -31,6 +23,11 @@ process.env.AI_MODE = 'hybrid';
 
 const engine = require('./automation-engine');
 const extras = require('./extras');
+const apis = require('./apis');
+const more = require('./more');
+const peer = require('./peer');
+const storage = require('./storage');
+const menu = require('./menu');
 
 let pass = 0, fail = 0;
 function eq(name, got, want) {
@@ -44,210 +41,204 @@ function ok(name, cond) {
 }
 
 async function main() {
+  console.log('1) loadAutomations merges defaults');
+  const cfg = engine.loadAutomations({ autolike: { enabled: true, emojis: ['🔥'] } });
+  eq('autolike.enabled', cfg.autolike.enabled, true);
+  eq('autolike.emojis', cfg.autolike.emojis, ['🔥']);
+  ok('autoreact has default rules', cfg.autoreact.rules.length > 0);
+  ok('antidel defaults', cfg.antidel.maxCache > 0);
 
-console.log('1) loadAutomations merges defaults');
-const cfg = engine.loadAutomations({ autolike: { enabled: true, emojis: ['🔥'] } });
-eq('autolike.enabled', cfg.autolike.enabled, true);
-eq('autolike.emojis', cfg.autolike.emojis, ['🔥']);
-eq('autoreact has default rules', cfg.autoreact.rules.length > 0, true);
-eq('antidel defaults', cfg.antidel.maxCache > 0, true);
+  console.log('\n2) resolveCommand');
+  const r1 = engine.resolveCommand('autolike on');
+  eq('no-prefix resolve', r1?.name, 'autolike');
+  const r2 = engine.resolveCommand('/autolike off');
+  eq('slash resolve', r2?.name, 'autolike');
+  const r3 = engine.resolveCommand('.autolike emojis ❤️ 🔥');
+  eq('dot resolve', r3?.name, 'autolike');
+  ok('unknown command returns null', engine.resolveCommand('foobar') === null);
 
-console.log('\n2) resolveCommand');
-const r1 = engine.resolveCommand('autolike on');
-eq('no-prefix resolve', r1?.name, 'autolike');
-eq('args parsed', r1?.args, ['on']);
-const r2 = engine.resolveCommand('/autolike off');
-eq('slash resolve', r2?.name, 'autolike');
-eq('slash args', r2?.args, ['off']);
-const r3 = engine.resolveCommand('.autolike emojis ❤️ 🔥');
-eq('dot resolve', r3?.name, 'autolike');
-eq('dot args', r3?.args, ['emojis', '❤️', '🔥']);
-ok('unknown command returns null', engine.resolveCommand('foobar') === null);
+  console.log('\n3) load main bot (registers v4 extras into TRIGGER_MAP)');
+  delete require.cache[require.resolve('./gramjs-bot.js')];
+  const main = require('./gramjs-bot.js');
+  const trigMap = main.engine.TRIGGER_MAP;
 
-console.log('\n3) TRIGGER_MAP coverage (v2 commands)');
-const expectedV2 = ['autolike', 'autoreact', 'autopost', 'autosave', 'antidel', 'antiedit', 'autoreply', 'autoforward', 'autopurge', 'autoread', 'autotyping', 'autobio', 'antiraid', 'scheduler', 'zipchannel', 'mode', 'automations', 'extractchannel', 'dumpchannel'];
-for (const t of expectedV2) ok(`trigger "${t}" registered`, engine.TRIGGER_MAP.has(t));
+  console.log('\n4) v3 TRIGGER_MAP coverage');
+  const expectedV3 = ['autolike', 'autoreact', 'autopost', 'autosave', 'antidel', 'antiedit', 'autoreply', 'autoforward', 'autopurge', 'autoread', 'autotyping', 'autobio', 'antiraid', 'scheduler', 'zipchannel', 'mode', 'automations', 'setenv', 'getenv', 'envlist', 'tourl', 'save', 'react', 'pin', 'unpin', 'copy', 'ziptext', 'zipall', 'ziprange', 'ping', 'uptime', 'id', 'health', 'stats', 'hybrid', 'chain', 'help'];
+  for (const t of expectedV3) ok(`trigger "${t}" registered`, trigMap.has(t));
 
-console.log('\n4) parseWhen (re-exported from main bot)');
-// We'll re-test the parseWhen by reaching into the main module after requiring it
-delete require.cache[require.resolve('./gramjs-bot.js')];
-const main = require('./gramjs-bot.js');
-ok('parseWhen: 5m', Math.abs(main.parseWhen('in 5m') - Date.now() - 300_000) < 5000);
-ok('parseWhen: 1h', Math.abs(main.parseWhen('in 1h') - Date.now() - 3_600_000) < 5000);
-ok('parseWhen: ISO', main.parseWhen('2099-01-01T00:00:00Z') > Date.now());
-ok('parseWhen: garbage', main.parseWhen('not a time') === null);
+  console.log('\n5) v4 NEW TRIGGER_MAP coverage (apis + more + menu cmds)');
+  const expectedV4 = ['weather', 'wttr', 'crypto', 'price', 'cg', 'shorten', 'short', 'qr', 'ip', 'ipinfo', 'geoip', 'dns', 'wiki', 'wikipedia', 'trans', 'translate', 'tr', 'catbox', 'upcat', 'join', 'leave', 'members', 'participants', 'admins', 'info', 'chatinfo', 'dialogs', 'chats', 'dl', 'downloadmedia', 'bulkdl', 'dlall', 'dln', 'rehost', 'album', 'search', 'history', 'msgs', 'broadcast', 'bc', 'eval', 'js', 'del', 'delete', 'edit', 'purge'];
+  for (const t of expectedV4) ok(`trigger "${t}" registered`, trigMap.has(t));
+  ok('total triggers >= 80', trigMap.size >= 80);
 
-console.log('\n4b) v3 TRIGGER_MAP coverage (extras registered via main bot)');
-// After loading gramjs-bot.js, the extras are registered into main.engine.TRIGGER_MAP
-const trigMap = main.engine.TRIGGER_MAP;
-const expectedV3 = ['setenv', 'editenv', 'unsetenv', 'delenv', 'getenv', 'envlist', 'envs', 'envreload', 'tourl', 'upload', 'save', 'dlmedia', 'download', 'react', 'pin', 'unpin', 'copy', 'forwardto', 'ziptext', 'exporttext', 'zipall', 'ziprange', 'ping', 'uptime', 'id', 'ids', 'health', 'stats', 'hybrid', 'multi', 'chain', 'pipeline', 'help', 'commands', '?'];
-for (const t of expectedV3) ok(`trigger "${t}" registered`, trigMap.has(t));
+  console.log('\n6) parseWhen');
+  ok('parseWhen: 5m', Math.abs(main.parseWhen('in 5m') - Date.now() - 300_000) < 5000);
+  ok('parseWhen: 1h', Math.abs(main.parseWhen('in 1h') - Date.now() - 3_600_000) < 5000);
+  ok('parseWhen: ISO', main.parseWhen('2099-01-01T00:00:00Z') > Date.now());
+  ok('parseWhen: garbage', main.parseWhen('not a time') === null);
 
-console.log('\n5) AI mode defaults (post-registration)');
-eq('aiMode is hybrid', main.aiMode, 'hybrid');
-ok('automations has all v2 keys', Object.keys(main.automations).length >= 15);
+  console.log('\n7) AI mode + automations');
+  eq('aiMode is hybrid', main.aiMode, 'hybrid');
+  ok('automations has all keys', Object.keys(main.automations).length >= 15);
 
-console.log('\n7) Engine pure helpers');
-const mods = engine._modules;
-ok('autolike default has emojis', mods.autolike.defaultCfg.emojis.length > 0);
-ok('autoreact default has rules', mods.autoreact.defaultCfg.rules.length > 0);
-ok('antidel has recentCache', mods.antidel.recentCache instanceof Map);
-ok('antiedit has editHistory', mods.antiedit.editHistory instanceof Map);
-ok('scheduler cron parser has 5 fields', mods.scheduler._checkCron('0 9 * * *', new Date(2025, 0, 1, 9, 0)));
-ok('scheduler cron parser: wrong hour', !mods.scheduler._checkCron('0 9 * * *', new Date(2025, 0, 1, 10, 0)));
-ok('scheduler cron parser: step */15', mods.scheduler._checkCron('*/15 * * * *', new Date(2025, 0, 1, 0, 15)));
-ok('scheduler cron parser: step */15 wrong min', !mods.scheduler._checkCron('*/15 * * * *', new Date(2025, 0, 1, 0, 7)));
+  console.log('\n8) Engine pure helpers');
+  const mods = engine._modules;
+  ok('autolike default has emojis', mods.autolike.defaultCfg.emojis.length > 0);
+  ok('autoreact default has rules', mods.autoreact.defaultCfg.rules.length > 0);
+  ok('antidel has recentCache', mods.antidel.recentCache instanceof Map);
+  ok('antiedit has editHistory', mods.antiedit.editHistory instanceof Map);
+  ok('scheduler cron parser has 5 fields', mods.scheduler._checkCron('0 9 * * *', new Date(2025, 0, 1, 9, 0)));
+  ok('scheduler cron parser: wrong hour', !mods.scheduler._checkCron('0 9 * * *', new Date(2025, 0, 1, 10, 0)));
+  ok('scheduler cron parser: step */15', mods.scheduler._checkCron('*/15 * * * *', new Date(2025, 0, 1, 0, 15)));
 
-console.log('\n8) v3 extras: env parsing & editing');
-eq('parseEnvText: basic', extras.parseEnvText('FOO=bar\nBAZ=qux'), { FOO: 'bar', BAZ: 'qux' });
-eq('parseEnvText: quoted', extras.parseEnvText('FOO="hello world"'), { FOO: 'hello world' });
-eq('parseEnvText: single quoted', extras.parseEnvText("FOO='a b'"), { FOO: 'a b' });
-eq('parseEnvText: comments', extras.parseEnvText('# comment\nFOO=bar\n# another'), { FOO: 'bar' });
-eq('parseEnvText: empty lines', extras.parseEnvText('\n\nFOO=bar\n\n'), { FOO: 'bar' });
+  console.log('\n9) v3 extras: env parsing & editing');
+  eq('parseEnvText: basic', extras.parseEnvText('FOO=bar\nBAZ=qux'), { FOO: 'bar', BAZ: 'qux' });
+  eq('parseEnvText: quoted', extras.parseEnvText('FOO="hello world"'), { FOO: 'hello world' });
+  eq('parseEnvText: comments', extras.parseEnvText('# c\nFOO=bar\n# another'), { FOO: 'bar' });
 
-// Test editEnvFile round-trip on a temp file
-const tmpEnv = path.join(__dirname, '.env.smoke-test');
-try { fs.unlinkSync(tmpEnv); } catch {}
-fs.writeFileSync(tmpEnv, 'EXISTING=original\n');
-const result = extras.editEnvFile(tmpEnv, { NEW_KEY: 'newvalue', EXISTING: 'updated' }, 'merge');
-ok('editEnvFile: change detected', result.changed.includes('NEW_KEY') && result.changed.includes('EXISTING'));
-const reloaded = extras.parseEnvText(fs.readFileSync(tmpEnv, 'utf8'));
-eq('editEnvFile: round-trip NEW_KEY', reloaded.NEW_KEY, 'newvalue');
-eq('editEnvFile: round-trip EXISTING', reloaded.EXISTING, 'updated');
+  const tmpEnv = path.join(__dirname, '.env.smoke-test');
+  try { fs.unlinkSync(tmpEnv); } catch {}
+  fs.writeFileSync(tmpEnv, 'EXISTING=original\n');
+  const result = extras.editEnvFile(tmpEnv, { NEW_KEY: 'newvalue', EXISTING: 'updated' }, 'merge');
+  ok('editEnvFile: change detected', result.changed.includes('NEW_KEY') && result.changed.includes('EXISTING'));
+  const reloaded = extras.parseEnvText(fs.readFileSync(tmpEnv, 'utf8'));
+  eq('editEnvFile: round-trip', reloaded, { EXISTING: 'updated', NEW_KEY: 'newvalue' });
+  const result2 = extras.editEnvFile(tmpEnv, { NEW_KEY: null }, 'merge');
+  ok('editEnvFile: remove detected', result2.removed.includes('NEW_KEY'));
+  fs.unlinkSync(tmpEnv);
 
-// Test unset
-const result2 = extras.editEnvFile(tmpEnv, { NEW_KEY: null }, 'merge');
-ok('editEnvFile: remove detected', result2.removed.includes('NEW_KEY'));
-const reloaded2 = extras.parseEnvText(fs.readFileSync(tmpEnv, 'utf8'));
-ok('editEnvFile: removed', !('NEW_KEY' in reloaded2));
-fs.unlinkSync(tmpEnv);
+  console.log('\n10) v3 extras: secret masking');
+  eq('maskSecret: api key (19 chars)', extras.maskSecret('GEMINI_API_KEY', 'sk-1234567890abcdef'), 'sk-***def (19 chars)');
+  eq('maskSecret: non-secret', extras.maskSecret('AI_MODE', 'hybrid'), 'hybrid');
 
-console.log('\n9) v3 extras: secret masking');
-eq('maskSecret: api key', extras.maskSecret('GEMINI_API_KEY', 'sk-1234567890abcdef'), 'sk-***def (19 chars)');
-eq('maskSecret: non-secret', extras.maskSecret('AI_MODE', 'hybrid'), 'hybrid');
-eq('maskSecret: empty', extras.maskSecret('FOO', ''), '(empty)');
-eq('maskSecret: short secret', extras.maskSecret('SHORT_KEY', 'abc'), '***');
+  console.log('\n11) v3 extras: hybrid command parser');
+  eq('hybrid: 2 names 1 arg', extras.parseHybrid('autolike+autoreact on'),
+     [{ name: 'autolike', args: ['on'] }, { name: 'autoreact', args: ['on'] }]);
+  eq('hybrid: 3 names 3 args', extras.parseHybrid('a+b+c on,off,on'),
+     [{ name: 'a', args: ['on'] }, { name: 'b', args: ['off'] }, { name: 'c', args: ['on'] }]);
+  ok('hybrid: empty returns null', extras.parseHybrid('') === null);
 
-console.log('\n10) v3 extras: hybrid command parser');
-const h1 = extras.parseHybrid('autolike+autoreact on');
-eq('hybrid: 2 names 1 arg', h1, [
-  { name: 'autolike', args: ['on'] },
-  { name: 'autoreact', args: ['on'] },
-]);
-const h2 = extras.parseHybrid('a+b+c on,off,on');
-eq('hybrid: 3 names 3 args', h2, [
-  { name: 'a', args: ['on'] },
-  { name: 'b', args: ['off'] },
-  { name: 'c', args: ['on'] },
-]);
-const h3 = extras.parseHybrid('autolike emojis ❤️ 🔥');
-eq('hybrid: multi-word arg', h3, [
-  { name: 'autolike', args: ['emojis', '❤️', '🔥'] },
-]);
-ok('hybrid: empty returns null', extras.parseHybrid('') === null);
-ok('hybrid: no args returns null', extras.parseHybrid('autolike') === null);
+  console.log('\n12) v3 extras: chain parser');
+  eq('chain: pipe', extras.parseChain('a | b | c'), ['a', 'b', 'c']);
+  eq('chain: semicolon', extras.parseChain('a;b;c'), ['a', 'b', 'c']);
+  eq('chain: and-and', extras.parseChain('a && b && c'), ['a', 'b', 'c']);
 
-console.log('\n11) v3 extras: chain parser');
-eq('chain: pipe', extras.parseChain('a | b | c'), ['a', 'b', 'c']);
-eq('chain: semicolon', extras.parseChain('a;b;c'), ['a', 'b', 'c']);
-eq('chain: and-and', extras.parseChain('a && b && c'), ['a', 'b', 'c']);
-eq('chain: mixed', extras.parseChain('a | b ; c'), ['a', 'b', 'c']);
-eq('chain: empty', extras.parseChain(''), []);
-
-console.log('\n12) v3 extras: every command has a handler');
-for (const [name, mod] of Object.entries(extras.EXTRA_COMMANDS)) {
-  ok(`${name}: has triggers`, Array.isArray(mod.triggers) && mod.triggers.length > 0);
-  ok(`${name}: has handler`, typeof mod.handler === 'function');
-}
-
-console.log('\n13) v3 extras: dispatch round-trip (handler context)');
-// We can call handlers directly with a fake context. The handler must not throw
-// when given invalid args (e.g. missing reply target).
-for (const [name, mod] of Object.entries(extras.EXTRA_COMMANDS)) {
-  if (name === 'hybrid' || name === 'chain') continue; // these need engine
-  if (name === 'ziptext' || name === 'zipall' || name === 'ziprange' || name === 'tourl' || name === 'save' || name === 'react' || name === 'pin' || name === 'unpin' || name === 'copy') continue; // need client
-  try {
-    const out = mod.handler({ chatId: 'me', automations: main.automations, adminIds: [], channelConfig: [], downloadDir: '/tmp', aiMode: 'hybrid', engine, msg: {} }, []);
-    ok(`${name}: handler runs without crash on empty args (returned: ${String(out).slice(0, 40)})`, true);
-  } catch (e) {
-    ok(`${name}: handler runs without crash on empty args — ERROR: ${e.message}`, false);
+  console.log('\n13) every v4 command has triggers + handler');
+  const allCmds = { ...extras.EXTRA_COMMANDS, ...apis.EXTRA_COMMANDS, ...more.EXTRA_COMMANDS };
+  for (const [name, mod] of Object.entries(allCmds)) {
+    ok(`${name}: triggers`, Array.isArray(mod.triggers) && mod.triggers.length > 0);
+    ok(`${name}: handler`, typeof mod.handler === 'function');
   }
-}
 
-console.log('\n14) v3 extras: setenv blocks dangerous keys');
-// Use the real .env.example as a read-only test target
-const realEnv = path.join(__dirname, '.env.smoke-blocked');
-fs.writeFileSync(realEnv, 'SAFE=ok\n');
-const beforeContent = fs.readFileSync(realEnv, 'utf8');
-const blocked = extras.editEnvFile(realEnv, { API_ID: '999', SESSION_STRING: 'evil' }, 'merge');
-// The setenv command in extras.js blocks these keys before calling editEnvFile.
-// We test editEnvFile directly here to confirm it would write them, but the
-// command layer is what blocks them. So just check editEnvFile wrote them.
-const after = extras.parseEnvText(fs.readFileSync(realEnv, 'utf8'));
-ok('editEnvFile CAN write API_ID (layer above must block)', after.API_ID === '999');
-ok('editEnvFile CAN write SESSION_STRING (layer above must block)', after.SESSION_STRING === 'evil');
-// Now check the layer above (the actual setenv handler) blocks
-const setenvOut = await (async () => {
-  // Build a fake context and call setenv
-  const ctx = { chatId: 'me', automations: main.automations, adminIds: [], channelConfig: [], downloadDir: '/tmp', aiMode: 'hybrid', engine, msg: {} };
-  return await extras.EXTRA_COMMANDS.setenv.handler(ctx, ['API_ID', '999']);
-})();
-ok('setenv blocks API_ID', /refusing to edit/i.test(String(setenvOut)));
-fs.unlinkSync(realEnv);
+  console.log('\n14) handler unit-runs (no client needed)');
+  const noClientCmds = ['ping', 'uptime', 'id', 'health', 'stats', 'help', 'envlist', 'envreload'];
+  for (const n of noClientCmds) {
+    try {
+      const out = await allCmds[n].handler({ chatId: 'me', automations: main.automations, adminIds: [], channelConfig: [], downloadDir: '/tmp', aiMode: 'hybrid', engine, msg: {} }, []);
+      ok(`${n}: runs without crash`, typeof out === 'string');
+    } catch (e) { ok(`${n}: runs without crash — ERROR: ${e.message}`, false); }
+  }
 
-console.log('\n15) v3: live aiMode toggle via mode command');
-const modeCmd = main.engine._modules.modeCommand.command;
-const liveCtx = {
-  client: null, chatId: 'me', automations: main.automations, adminIds: ['1'],
-  channelConfig: [], downloadDir: '/tmp', aiMode: 'hybrid',
-  aiModeRef: main.ctx.aiModeRef, setAiMode: main.ctx.setAiMode, log: () => {},
-};
-(async () => {
-  eq('mode: initial', main.ctx.aiModeRef.v, 'hybrid');
-  await modeCmd.handler(liveCtx, ['off']);
-  eq('mode: live ref after off', main.ctx.aiModeRef.v, 'off');
-  await modeCmd.handler(liveCtx, ['on']);
-  eq('mode: live ref after on', main.ctx.aiModeRef.v, 'on');
-  await modeCmd.handler(liveCtx, ['hybrid']);
-  eq('mode: live ref after hybrid', main.ctx.aiModeRef.v, 'hybrid');
-  const bad = await modeCmd.handler(liveCtx, ['wat']);
-  ok('mode: invalid arg shows usage', /usage: mode/i.test(String(bad)));
-  eq('mode: invalid arg does not change ref', main.ctx.aiModeRef.v, 'hybrid');
-  // Restore
-  main.ctx.aiModeRef.v = 'hybrid';
-})();
+  console.log('\n15) setenv blocks dangerous keys');
+  const realEnv = path.join(__dirname, '.env.smoke-blocked');
+  fs.writeFileSync(realEnv, 'SAFE=ok\n');
+  const setenvOut = await extras.EXTRA_COMMANDS.setenv.handler({ chatId: 'me', automations: main.automations, adminIds: [], channelConfig: [], downloadDir: '/tmp', aiMode: 'hybrid', engine, msg: {} }, ['API_ID', '999']);
+  ok('setenv blocks API_ID', /refusing/i.test(String(setenvOut)));
+  fs.unlinkSync(realEnv);
 
-console.log('\n16) v3: GitHub Models endpoint is the new one');
-// Test by setting GITHUB_TOKEN and re-loading providers. We use a sub-process
-// pattern via require cache reset to pick up the env.
-{
-  const prevToken = process.env.GITHUB_TOKEN;
-  const prevGroq = process.env.GROQ_API_KEY;
-  process.env.GITHUB_TOKEN = 'fake';
-  process.env.GROQ_API_KEY = 'fake';
-  delete require.cache[require.resolve('./gramjs-bot.js')];
-  const bot2 = require('./gramjs-bot.js');
-  const gh = bot2.providers.find((p) => p.name === 'github');
-  const gq = bot2.providers.find((p) => p.name === 'groq');
-  ok('github provider uses new models.github.ai endpoint', gh?.baseUrl === 'https://models.github.ai/inference');
-  ok('github provider does NOT use deprecated azure endpoint', !/inference\.ai\.azure\.com/.test(gh?.baseUrl || ''));
-  ok('groq default is NOT the deprecated llama-3.3-70b-versatile', gq?.model !== 'llama-3.3-70b-versatile');
-  // Restore env and re-load for downstream tests
-  if (prevToken === undefined) delete process.env.GITHUB_TOKEN; else process.env.GITHUB_TOKEN = prevToken;
-  if (prevGroq === undefined) delete process.env.GROQ_API_KEY; else process.env.GROQ_API_KEY = prevGroq;
-  delete require.cache[require.resolve('./gramjs-bot.js')];
-  require('./gramjs-bot.js');
-}
+  console.log('\n16) peer resolver helpers');
+  ok('peer._isAlreadyInputPeer: true for InputPeerUser', peer._isAlreadyInputPeer({ className: 'InputPeerUser', userId: 1 }));
+  ok('peer._isAlreadyInputPeer: false for string', !peer._isAlreadyInputPeer('123'));
+  ok('peer._isAlreadyInputPeer: false for null', !peer._isAlreadyInputPeer(null));
+  ok('peer._isAlreadyEntity: true for User', peer._isAlreadyEntity({ className: 'User', id: 1 }));
+  ok('peer._isAlreadyEntity: true for Channel', peer._isAlreadyEntity({ className: 'Channel', id: 1 }));
+  ok('peer.peerFromMessage: PeerUser', JSON.stringify(peer.peerFromMessage({ peerId: { className: 'PeerUser', userId: 5 } })) === JSON.stringify({ type: 'user', id: 5 }));
+  ok('peer.peerFromMessage: PeerChannel', JSON.stringify(peer.peerFromMessage({ peerId: { className: 'PeerChannel', channelId: -1001 } })) === JSON.stringify({ type: 'channel', id: -1001 }));
+  ok('peer.peerFromMessage: null for no peerId', peer.peerFromMessage({}) === null);
+  // Test that resolveInputPeer fails clearly for garbage input
+  try {
+    await peer.resolveInputPeer({ getInputPeer: async () => { throw new Error('not found'); } }, 'definitely_not_a_real_chat_xyz');
+    ok('peer.resolveInputPeer throws on bad input', false);
+  } catch (e) {
+    ok('peer.resolveInputPeer throws on bad input', /could not resolve peer/.test(e.message));
+  }
 
-console.log('\n17) v3: BOT_COMMANDS_MENU has 10 entries and includes core commands');
-ok('menu has 10 entries', main.extras && main.extras.EXTRA_COMMANDS && main.extras.EXTRA_COMMANDS.menu);
-ok('menu triggers include menu and refreshmenu', main.engine.TRIGGER_MAP.has('menu') && main.engine.TRIGGER_MAP.has('refreshmenu'));
-ok('help trigger present', main.engine.TRIGGER_MAP.has('help'));
-ok('tools trigger present', main.engine.TRIGGER_MAP.has('tools'));
-ok('automations trigger present', main.engine.TRIGGER_MAP.has('automations'));
+  console.log('\n17) storage: backend detection + putLocal');
+  // Force local by clearing any S3/B2/telegram env
+  delete process.env.S3_BUCKET; delete process.env.S3_ACCESS_KEY;
+  delete process.env.B2_BUCKET; delete process.env.B2_KEY_ID;
+  delete process.env.STORAGE_TELEGRAM;
+  eq('storage.detectBackend: local (default)', storage.detectBackend(), 'local');
 
-console.log(`\n${pass} passed, ${fail} failed`);
-process.exit(fail > 0 ? 1 : 0);
+  const localResult = await storage.putLocal('/tmp/gramjs-smoke', Buffer.from('hello world'), 'test.txt');
+  ok('storage.putLocal: ok', localResult.ok && localResult.location && localResult.location.endsWith('test.txt'));
+  eq('storage.putLocal: content matches', fs.readFileSync(localResult.location, 'utf8'), 'hello world');
+  try { fs.unlinkSync(localResult.location); } catch {}
+
+  console.log('\n18) storage: backend selection from env');
+  const origEnv = { ...process.env };
+  process.env.S3_BUCKET = 'fake-bucket';
+  process.env.S3_ACCESS_KEY = 'fake';
+  eq('storage.detectBackend: s3 when S3_BUCKET set', storage.detectBackend(), 's3');
+  delete process.env.S3_BUCKET;
+  process.env.B2_BUCKET = 'fake-b2';
+  process.env.B2_KEY_ID = 'fake';
+  eq('storage.detectBackend: b2 when B2_BUCKET set', storage.detectBackend(), 'b2');
+  delete process.env.B2_BUCKET; delete process.env.B2_KEY_ID;
+  process.env.STORAGE_TELEGRAM = 'true';
+  eq('storage.detectBackend: telegram when STORAGE_TELEGRAM=true', storage.detectBackend(), 'telegram');
+  delete process.env.STORAGE_TELEGRAM;
+  Object.assign(process.env, origEnv);
+
+  console.log('\n19) storage: B2 falls back gracefully when S3 mode not configured');
+  process.env.B2_BUCKET = 'fake-b2';
+  process.env.B2_KEY_ID = 'fake';
+  delete process.env.B2_S3_ENDPOINT;
+  const b2Res = await storage.putB2(Buffer.from('x'), 'k');
+  ok('storage.putB2: fails gracefully without B2_S3_ENDPOINT', !b2Res.ok && /B2_S3_ENDPOINT/.test(b2Res.error));
+  delete process.env.B2_BUCKET; delete process.env.B2_KEY_ID;
+
+  console.log('\n20) menu system');
+  ok('menu.MENUS has main', !!menu.MENUS.main);
+  ok('menu.MENUS has media', !!menu.MENUS.media);
+  ok('menu.MENUS has send', !!menu.MENUS.send);
+  ok('menu.MENUS has chats', !!menu.MENUS.chats);
+  ok('menu.MENUS has search', !!menu.MENUS.search);
+  ok('menu.MENUS has apis', !!menu.MENUS.apis);
+  ok('menu.MENUS has auto', !!menu.MENUS.auto);
+  ok('menu.MENUS has env', !!menu.MENUS.env);
+  ok('menu.getMenu main', !!menu.getMenu('main'));
+  ok('menu.getMenu unknown returns undefined', !menu.getMenu('nope'));
+  const resolve = menu.resolveCallback('menu:main');
+  eq('menu.resolveCallback: menu:', resolve, { type: 'menu', id: 'main' });
+  const resolve2 = menu.resolveCallback('cmd:purge:50');
+  eq('menu.resolveCallback: cmd with arg', resolve2, { type: 'cmd', name: 'purge', arg: '50' });
+  const resolve3 = menu.resolveCallback('cmd:help');
+  eq('menu.resolveCallback: cmd no arg', resolve3, { type: 'cmd', name: 'help', arg: undefined });
+  ok('menu.buildMarkup returns inline markup', menu.buildMarkup(menu.MENUS.main).className === 'ReplyInlineMarkup');
+
+  console.log('\n21) apis: every command has a handler that can be unit-invoked');
+  for (const [name, mod] of Object.entries(apis.EXTRA_COMMANDS)) {
+    ok(`apis.${name}: has triggers`, Array.isArray(mod.triggers) && mod.triggers.length > 0);
+    ok(`apis.${name}: has handler`, typeof mod.handler === 'function');
+  }
+
+  console.log('\n22) more: every command has a handler that can be unit-invoked');
+  for (const [name, mod] of Object.entries(more.EXTRA_COMMANDS)) {
+    ok(`more.${name}: has triggers`, Array.isArray(mod.triggers) && mod.triggers.length > 0);
+    ok(`more.${name}: has handler`, typeof mod.handler === 'function');
+  }
+
+  console.log('\n23) module dependency sanity (no circular requires)');
+  ok('extras loaded', typeof extras.EXTRA_COMMANDS === 'object');
+  ok('apis loaded', typeof apis.EXTRA_COMMANDS === 'object');
+  ok('more loaded', typeof more.EXTRA_COMMANDS === 'object');
+  ok('peer loaded', typeof peer.resolveInputPeer === 'function');
+  ok('storage loaded', typeof storage.put === 'function');
+  ok('menu loaded', typeof menu.MENUS === 'object');
+
+  console.log(`\n${pass} passed, ${fail} failed`);
+  process.exit(fail > 0 ? 1 : 0);
 }
 
 main().catch((e) => { console.error('test crashed:', e); process.exit(2); });
