@@ -219,3 +219,17 @@ package.json
 - All admin-only write actions (sending, reacting, posting, pinning, forwarding) are still gated by `AGENT_ADMIN_IDS` for the LLM tools. Automation commands that trigger writes (`autopost`, `autoforward`, `autopurge`, `scheduler`) require the sender to be in `AGENT_ADMIN_IDS` too.
 - v3 `tourl` uses catbox.moe's free endpoint. No API key required. Files up to 200MB. If catbox is down, the command replies with the error and doesn't crash.
 - v3 `setenv`/`unsetenv` only block the three highest-risk keys (`API_ID`, `API_HASH`, `SESSION_STRING`). All other keys are writable. Sensitive-key changes are flagged with "takes effect on next restart".
+
+---
+
+## v3.1 patch notes
+
+- **Fixed `mode` command** — toggling AI mode now actually flips the live mode (was writing to a local ctx copy that `handleMessage` never re-read).
+- **Fixed GitHub Models provider endpoint** — the old `models.inference.ai.azure.com` was deprecated 2025-07-17 and removed 2025-10-17. Now uses the new `https://models.github.ai/inference` endpoint.
+- **Updated Groq default model** away from `llama-3.3-70b-versatile` (deprecated, EOL 2026-08-16) to `openai/gpt-oss-120b`.
+- **Unified `/help` and `help`** — both return the same v3 reference now.
+- **Added `menu` command** — prints the commands list and (on bot accounts only) publishes it via `bots.setBotCommands`. User accounts get a clean inline list since `bots.setBotCommands` is bot-only.
+- **Slash parity for `/id`, `/uptime`, `/health`, `/stats`, `/ping`, `/menu`** — these now work as both `/cmd` (slash) and `cmd` (no-prefix).
+- **Persisted `AI_MODE` to `.env`** when changed via `mode` command.
+- **`tourl` timeout** — 60s cap on catbox uploads so the bot doesn't hang.
+- **New `tools` no-prefix command** — same as `/tools`, lists the LLM tool surface.
