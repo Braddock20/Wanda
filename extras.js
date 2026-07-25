@@ -137,27 +137,70 @@ function parseChain(text) {
 
 async function uploadToCatbox(buffer, filename) {
   // Node 18+ global fetch, native FormData
-  if (typeof fetch !== 'function' || typeof FormData === 'undefined' || typeof Blob === 'undefined') {
-    return { error: 'fetch/FormData/Blob not available — need Node 18+' };
+  if (typeof fetch !== 'function' || typeof FormData === 'undefined') {
+    return { error: 'fetch/FormData not available — need Node 18+' };
   }
+  // Try multiple shapes to maximise compat with catbox's parser
   const fd = new FormData();
   fd.append('reqtype', 'fileupload');
-  fd.append('fileToUpload', new Blob([buffer]), filename || 'upload.bin');
-  // 60s timeout via AbortController so a slow/dead catbox doesn't hang the bot.
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), 60_000);
+  // Node FormData accepts Buffer, Blob, or File. Try File first (with type),
+  // fall back to Blob, then raw Buffer.
+  let fileField;
+  if (typeof File !== 'undefined') {
+    fileField = new File([buffer], filename || 'upload.bin', { type: 'application/octet-stream' });
+  } else if (typeof Blob !== 'undefined') {
+    fileField = new Blob([buffer], { type: 'application/octet-stream' });
+  } else {
+    fileField = buffer;
+  }
+  fd.append('fileToUpload', fileField);
   try {
-    const res = await fetch('https://catbox.moe/user/api.php', { method: 'POST', body: fd, signal: ac.signal });
+    const res = await fetch('https://catbox.moe/user/api.php', { method: 'POST', body: fd });
     const text = (await res.text()).trim();
     if (!res.ok) return { error: `catbox ${res.status}: ${text.slice(0, 200)}` };
     if (!/^https?:\/\//.test(text)) return { error: `catbox returned non-url: ${text.slice(0, 200)}` };
     return { url: text };
   } catch (e) {
-    if (e?.name === 'AbortError') return { error: 'catbox upload timed out after 60s' };
     return { error: `catbox upload failed: ${e.message}` };
-  } finally {
-    clearTimeout(t);
   }
+}
+
+// Fallback: tmpfiles.org (also free, also no API key, also accepts multipart)
+async function uploadToTmpfiles(buffer, filename) {
+  if (typeof fetch !== 'function' || typeof FormData === 'undefined') {
+    return { error: 'fetch/FormData not available — need Node 18+' };
+  }
+  const fd = new FormData();
+  let fileField;
+  if (typeof File !== 'undefined') {
+    fileField = new File([buffer], filename || 'upload.bin', { type: 'application/octet-stream' });
+  } else if (typeof Blob !== 'undefined') {
+    fileField = new Blob([buffer], { type: 'application/octet-stream' });
+  } else {
+    fileField = buffer;
+  }
+  fd.append('file', fileField);
+  try {
+    const res = await fetch('https://tmpfiles.org/api/v1/upload', { method: 'POST', body: fd });
+    const text = await res.text();
+    if (!res.ok) return { error: `tmpfiles ${res.status}: ${text.slice(0, 200)}` };
+    const j = JSON.parse(text);
+    if (j.status !== 'success' || !j.data?.url) return { error: `tmpfiles bad response: ${text.slice(0, 200)}` };
+    // tmpfiles returns a viewer URL; convert to direct
+    const direct = String(j.data.url).replace('tmpfiles.org/', 'tmpfiles.org/dl/');
+    return { url: direct };
+  } catch (e) {
+    return { error: `tmpfiles upload failed: ${e.message}` };
+  }
+}
+
+// Combined: try catbox first, fall back to tmpfiles
+async function uploadToAny(buffer, filename) {
+  const r1 = await uploadToCatbox(buffer, filename);
+  if (!r1.error) return { url: r1.url, backend: 'catbox' };
+  const r2 = await uploadToTmpfiles(buffer, filename);
+  if (!r2.error) return { url: r2.url, backend: 'tmpfiles', catboxError: r1.error };
+  return { error: `catbox: ${r1.error}; tmpfiles: ${r2.error}` };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -307,9 +350,10 @@ const EXTRA_COMMANDS = {
       if (target.error) return `tourl: ${target.error}`;
       const ext = extForMessage(target.message);
       const filename = `${target.message.id}_${Date.now()}${ext}`;
-      const res = await uploadToCatbox(target.buffer, filename);
+      const res = await uploadToAny(target.buffer, filename);
       if (res.error) return `tourl: ${res.error}`;
-      return `🔗 ${res.url}`;
+      const note = res.catboxError ? ` (catbox failed, used ${res.backend})` : '';
+      return `🔗 ${res.url}${note}`;
     },
   },
 
@@ -338,8 +382,10 @@ const EXTRA_COMMANDS = {
       const targetId = (typeof ctx.msg.replyTo === 'object' ? ctx.msg.replyTo?.replyToMsgId : ctx.msg.replyTo) || ctx.msg.replyToMessage?.id;
       if (!targetId) return 'no replied message id';
       try {
+        const { resolveInputPeer } = require('./peer');
+        const peer = await resolveInputPeer(ctx.client, ctx.msg.chatId);
         await ctx.client.invoke(new ctx.Api.messages.SendReaction({
-          peer: ctx.msg.chatId, msgId: targetId,
+          peer, msgId: targetId,
           reaction: [new ctx.Api.ReactionEmoji({ emoticon: emoji })], big: false,
         }));
         return `reacted ${emoji}`;
@@ -355,7 +401,9 @@ const EXTRA_COMMANDS = {
       if (!ctx.msg.replyTo && !ctx.msg.replyToMessage) return 'reply to a message first';
       const targetId = (typeof ctx.msg.replyTo === 'object' ? ctx.msg.replyTo?.replyToMsgId : ctx.msg.replyTo) || ctx.msg.replyToMessage?.id;
       try {
-        await ctx.client.invoke(new ctx.Api.messages.UpdatePinnedMessage({ peer: ctx.msg.chatId, id: targetId, unpin: false }));
+        const { resolveInputPeer } = require('./peer');
+        const peer = await resolveInputPeer(ctx.client, ctx.msg.chatId);
+        await ctx.client.invoke(new ctx.Api.messages.UpdatePinnedMessage({ peer, id: targetId, unpin: false }));
         return 'pinned';
       } catch (e) { return `pin failed: ${e.message}`; }
     },
@@ -367,7 +415,9 @@ const EXTRA_COMMANDS = {
       if (!ctx.msg.replyTo && !ctx.msg.replyToMessage) return 'reply to a message first';
       const targetId = (typeof ctx.msg.replyTo === 'object' ? ctx.msg.replyTo?.replyToMsgId : ctx.msg.replyTo) || ctx.msg.replyToMessage?.id;
       try {
-        await ctx.client.invoke(new ctx.Api.messages.UpdatePinnedMessage({ peer: ctx.msg.chatId, id: targetId, unpin: true }));
+        const { resolveInputPeer } = require('./peer');
+        const peer = await resolveInputPeer(ctx.client, ctx.msg.chatId);
+        await ctx.client.invoke(new ctx.Api.messages.UpdatePinnedMessage({ peer, id: targetId, unpin: true }));
         return 'unpinned';
       } catch (e) { return `unpin failed: ${e.message}`; }
     },
@@ -652,69 +702,13 @@ const EXTRA_COMMANDS = {
     },
   },
 
-  // ── Menu refresh (re-publishes Telegram's bot commands menu) ───────
-  menu: {
-    triggers: ['menu', 'refreshmenu'],
-    async handler(ctx, args) {
-      if (!ctx.client) return 'menu: client not ready';
-      // bots.setBotCommands only works for bot accounts. User accounts
-      // (this whole bot is a userbot) get USER_BOT_REQUIRED — expected.
-      // Print the list inline instead so admins always see it.
-      const lines = [
-        '── bot commands (no-prefix for admins) ──',
-        '  help · tools · automations · mode · health · ping',
-        '  id · uptime · stats · whoami · reset · menu',
-        '  autolike · autoreact · autopost · autosave · antidel',
-        '  antiedit · autoreply · autoforward · autopurge · autoread',
-        '  autotyping · autobio · antiraid · scheduler · zipchannel',
-        '  setenv · unsetenv · getenv · envlist · envreload',
-        '  tourl · save · react · pin · unpin · copy',
-        '  ziptext · zipall · ziprange',
-        '  hybrid · chain',
-      ];
-      try {
-        const me = await ctx.client.getMe();
-        if (me && me.bot) {
-          const commands = [
-            { command: 'help', description: 'Show all commands' },
-            { command: 'tools', description: 'List LLM tools' },
-            { command: 'automations', description: 'Show automation status' },
-            { command: 'mode', description: 'AI mode: on | off | hybrid' },
-            { command: 'health', description: 'Bot health snapshot' },
-            { command: 'ping', description: 'Latency check' },
-            { command: 'id', description: 'Chat / msg / sender ids' },
-            { command: 'whoami', description: 'Your id + admin status' },
-            { command: 'reset', description: 'Clear DM chat history' },
-            { command: 'menu', description: 'Refresh bot commands menu' },
-          ];
-          const cmds = commands.map((c) => new ctx.Api.BotCommand({ command: c.command, description: c.description }));
-          await ctx.client.invoke(new ctx.Api.bots.setBotCommands({
-            scope: new ctx.Api.BotCommandScopeDefault(),
-            langCode: '',
-            commands: cmds,
-          }));
-          return `${lines.join('\n')}\n\n✅ published to Telegram (bot account)`;
-        }
-      } catch (e) {
-        return `${lines.join('\n')}\n\n⚠️  Telegram publish failed: ${e.message}`;
-      }
-      return `${lines.join('\n')}\n\n(user account — Telegram's bot command menu is bot-only; this list is the source of truth)`;
-    },
-  },
-
   // ── Mode extras ──────────────────────────────────────────────────────
   help: {
     triggers: ['help', 'commands', '?'],
     async handler(ctx, args) {
-      const mode = (ctx.aiModeRef && ctx.aiModeRef.v) || ctx.aiMode || 'hybrid';
       const lines = [
         '── gramjs-bot v3 commands ──',
-        `AI mode: ${mode}  |  Use / or . or no-prefix (admins).`,
-        '',
-        '── Slash menu (shown in Telegram "/" button) ──',
-        '  help · tools · automations · mode · health · ping · id',
-        '  whoami · reset · menu',
-        '  → "menu" re-publishes the bot commands list',
+        'Prefix-free for admins. / or . also works.',
         '',
         '── Env (edit .env from chat) ──',
         '  setenv KEY VALUE       — set a .env value, live where possible',
@@ -731,29 +725,21 @@ const EXTRA_COMMANDS = {
         '  copy <@chat>           — forward replied media to another chat',
         '',
         '── Channel export ──',
-        '  zipchannel <@chan> [n] — media only',
+        '  zipchannel <@chan> [n] — media only (existing)',
         '  ziptext <@chan> [n]    — text only, as JSON+NDJSON',
         '  zipall <@chan>         — every media ever (capped 5000)',
         '  ziprange <@chan> a b   — media between two msg ids',
         '',
         '── Hybrid / chain ──',
         '  hybrid a+b+c on        — toggle multiple at once',
-        '  hybrid a+b+c on,off,on — different arg per automation',
-        '  chain "a on | b on"    — run a pipeline (| or ; or &&)',
-        '',
-        '── Automation commands (no-prefix) ──',
-        '  autolike / autoreact / autopost / autosave / antidel',
-        '  antiedit / autoreply / autoforward / autopurge / autoread',
-        '  autotyping / autobio / antiraid / scheduler / zipchannel',
-        '  → "automations" shows status of all',
+        '  chain "a on | b on"    — run a pipeline',
         '',
         '── Utility ──',
-        '  ping / uptime / id / health / stats / whoami / reset',
-        '  mode on|off|hybrid     — live AI mode toggle (persists to .env)',
-        '  menu                   — refresh the Telegram commands menu',
+        '  ping / uptime / id / health / stats / whoami',
+        '  help / tools / automations / mode on|off|hybrid / reset',
         '',
         '── AI tools (LLM) ──',
-        '  27 native Telegram tools + custom AGENT_TOOLS',
+        '  27 native tools + your custom AGENT_TOOLS',
         '  In DMs the bot auto-routes to the LLM agent',
         '  AI mode off: commands work, no LLM calls',
       ];
@@ -765,6 +751,6 @@ const EXTRA_COMMANDS = {
 module.exports = {
   EXTRA_COMMANDS,
   parseEnvText, serializeEnv, editEnvFile, maskSecret, parseHybrid, parseChain,
-  uploadToCatbox, getReplyMedia, extForMessage, safeName,
+  uploadToCatbox, uploadToTmpfiles, uploadToAny, getReplyMedia, extForMessage, safeName,
   ENV_BLOCKLIST, ENV_REQUIRES_RESTART, SECRET_HINTS,
 };
