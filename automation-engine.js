@@ -891,6 +891,34 @@ const allCommand = {
 // Mode control: ai on/off/hybrid
 // ─────────────────────────────────────────────────────────────────────────
 
+const toolsCommand = {
+  name: 'tools',
+  description: 'List LLM tools the agent can call.',
+  defaultCfg: {},
+  command: {
+    triggers: ['tools'],
+    async handler(ctx, args) {
+      // The full tool list lives in gramjs-bot.js; it isn't imported here to
+      // keep the engine decoupled. We return a friendly placeholder that
+      // mirrors the /tools slash output when the slash isn't used.
+      const lines = [
+        'LLM tools: 27 native Telegram tools + your custom AGENT_TOOLS',
+        '  send_message · reply_to_message · get_chat_history · get_me',
+        '  set_typing · search_messages · resolve_username · get_user_info',
+        '  get_dialogs · list_channel_media · get_channel_info',
+        '  react_to_message · comment_on_post · forward_post',
+        '  pin_message · unpin_message · post_to_channel · download_media',
+        '  send_photo · send_video · send_document · send_voice',
+        '  translate_text · summarize_chat · schedule_reminder',
+        '  list_reminders · cancel_reminder',
+        '',
+        'For a live tool list, send /tools (uses the running bot context).',
+      ];
+      return lines.join('\n');
+    },
+  },
+};
+
 const modeCommand = {
   name: 'mode',
   description: 'AI mode control: on | off | hybrid',
@@ -900,10 +928,35 @@ const modeCommand = {
     async handler(ctx, args) {
       const m = String(args[0] || '').toLowerCase();
       if (['on', 'off', 'hybrid'].includes(m)) {
-        ctx.aiMode = m;
-        return `AI mode: ${m}\n${m === 'off' ? '(commands still work, no LLM calls)' : m === 'on' ? '(every DM goes through LLM)' : '(commands skip AI, DMs use AI)'}`;
+        // Use the live ref (set by gramjs-bot.js) so the change actually
+        // takes effect for the next message. Fall back to writing the
+        // local ctx field for tests.
+        if (typeof ctx.setAiMode === 'function') {
+          ctx.setAiMode(m);
+        } else if (ctx.aiModeRef) {
+          ctx.aiModeRef.v = m;
+          ctx.aiMode = m;
+        } else {
+          ctx.aiMode = m;
+        }
+        // Best-effort: persist to .env so it survives restarts
+        let persisted = false;
+        try {
+          const fs = require('fs');
+          const path = require('path');
+          const envPath = path.join(process.cwd(), '.env');
+          if (fs.existsSync(envPath)) {
+            const cur = fs.readFileSync(envPath, 'utf8');
+            const re = /^AI_MODE=.*$/m;
+            const next = re.test(cur) ? cur.replace(re, `AI_MODE=${m}`) : cur.replace(/\s*$/, '') + `\nAI_MODE=${m}\n`;
+            if (next !== cur) { fs.writeFileSync(envPath, next); persisted = true; }
+          }
+        } catch {}
+        const note = m === 'off' ? '(commands still work, no LLM calls)' : m === 'on' ? '(every DM goes through LLM)' : '(commands skip AI, DMs use AI)';
+        return `AI mode: ${m}\n${note}${persisted ? '\n💾 saved to .env' : ''}`;
       }
-      return `AI mode: ${ctx.aiMode}\nusage: mode on | off | hybrid`;
+      const current = ctx.aiModeRef ? ctx.aiModeRef.v : ctx.aiMode;
+      return `AI mode: ${current}\nusage: mode on | off | hybrid`;
     },
   },
 };
@@ -929,6 +982,7 @@ const AUTOMATIONS = [
   scheduler,
   zipchannel,
   allCommand,
+  toolsCommand,
   modeCommand,
 ];
 
@@ -969,5 +1023,5 @@ module.exports = {
   loadAutomations,
   resolveCommand,
   // expose modules for testing
-  _modules: { autolike, autoreact, autopost, autosave, antidel, antiedit, autoreply, autoforward, autopurge, autoread, autotyping, autobio, antiraid, scheduler, zipchannel, allCommand, modeCommand },
+  _modules: { autolike, autoreact, autopost, autosave, antidel, antiedit, autoreply, autoforward, autopurge, autoread, autotyping, autobio, antiraid, scheduler, zipchannel, allCommand, toolsCommand, modeCommand },
 };
