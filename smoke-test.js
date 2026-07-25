@@ -195,6 +195,57 @@ const setenvOut = await (async () => {
 ok('setenv blocks API_ID', /refusing to edit/i.test(String(setenvOut)));
 fs.unlinkSync(realEnv);
 
+console.log('\n15) v3: live aiMode toggle via mode command');
+const modeCmd = main.engine._modules.modeCommand.command;
+const liveCtx = {
+  client: null, chatId: 'me', automations: main.automations, adminIds: ['1'],
+  channelConfig: [], downloadDir: '/tmp', aiMode: 'hybrid',
+  aiModeRef: main.ctx.aiModeRef, setAiMode: main.ctx.setAiMode, log: () => {},
+};
+(async () => {
+  eq('mode: initial', main.ctx.aiModeRef.v, 'hybrid');
+  await modeCmd.handler(liveCtx, ['off']);
+  eq('mode: live ref after off', main.ctx.aiModeRef.v, 'off');
+  await modeCmd.handler(liveCtx, ['on']);
+  eq('mode: live ref after on', main.ctx.aiModeRef.v, 'on');
+  await modeCmd.handler(liveCtx, ['hybrid']);
+  eq('mode: live ref after hybrid', main.ctx.aiModeRef.v, 'hybrid');
+  const bad = await modeCmd.handler(liveCtx, ['wat']);
+  ok('mode: invalid arg shows usage', /usage: mode/i.test(String(bad)));
+  eq('mode: invalid arg does not change ref', main.ctx.aiModeRef.v, 'hybrid');
+  // Restore
+  main.ctx.aiModeRef.v = 'hybrid';
+})();
+
+console.log('\n16) v3: GitHub Models endpoint is the new one');
+// Test by setting GITHUB_TOKEN and re-loading providers. We use a sub-process
+// pattern via require cache reset to pick up the env.
+{
+  const prevToken = process.env.GITHUB_TOKEN;
+  const prevGroq = process.env.GROQ_API_KEY;
+  process.env.GITHUB_TOKEN = 'fake';
+  process.env.GROQ_API_KEY = 'fake';
+  delete require.cache[require.resolve('./gramjs-bot.js')];
+  const bot2 = require('./gramjs-bot.js');
+  const gh = bot2.providers.find((p) => p.name === 'github');
+  const gq = bot2.providers.find((p) => p.name === 'groq');
+  ok('github provider uses new models.github.ai endpoint', gh?.baseUrl === 'https://models.github.ai/inference');
+  ok('github provider does NOT use deprecated azure endpoint', !/inference\.ai\.azure\.com/.test(gh?.baseUrl || ''));
+  ok('groq default is NOT the deprecated llama-3.3-70b-versatile', gq?.model !== 'llama-3.3-70b-versatile');
+  // Restore env and re-load for downstream tests
+  if (prevToken === undefined) delete process.env.GITHUB_TOKEN; else process.env.GITHUB_TOKEN = prevToken;
+  if (prevGroq === undefined) delete process.env.GROQ_API_KEY; else process.env.GROQ_API_KEY = prevGroq;
+  delete require.cache[require.resolve('./gramjs-bot.js')];
+  require('./gramjs-bot.js');
+}
+
+console.log('\n17) v3: BOT_COMMANDS_MENU has 10 entries and includes core commands');
+ok('menu has 10 entries', main.extras && main.extras.EXTRA_COMMANDS && main.extras.EXTRA_COMMANDS.menu);
+ok('menu triggers include menu and refreshmenu', main.engine.TRIGGER_MAP.has('menu') && main.engine.TRIGGER_MAP.has('refreshmenu'));
+ok('help trigger present', main.engine.TRIGGER_MAP.has('help'));
+ok('tools trigger present', main.engine.TRIGGER_MAP.has('tools'));
+ok('automations trigger present', main.engine.TRIGGER_MAP.has('automations'));
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);
 }
