@@ -23,21 +23,29 @@ const { NewMessage, DeletedMessage, EditedMessage, ChatAction } = require('telep
 
 const engine = require('./automation-engine');
 const extras = require('./extras');
+const apis = require('./apis');
+const more = require('./more');
 
-// Register all v3 extras into the engine's trigger map so they participate
+// Register all v3/v4 extras into the engine's trigger map so they participate
 // in no-prefix / slash command resolution and hybrid/chain dispatch.
-for (const [name, mod] of Object.entries(extras.EXTRA_COMMANDS)) {
-  const triggers = mod.command?.triggers || mod.triggers;
-  const handler = mod.command?.handler || mod.handler;
-  if (!triggers || !handler) continue;
-  // Normalize to engine's { command: { triggers, handler } } shape
-  if (!mod.command) mod.command = { triggers, handler };
-  // Expose as a synthetic automation so TRIGGER_MAP picks it up.
-  engine._modules[name] = { name, description: 'v3 extra', defaultCfg: {}, command: mod.command };
-  for (const t of triggers) {
-    engine.TRIGGER_MAP.set(t.toLowerCase(), engine._modules[name]);
+for (const src of [extras, apis, more]) {
+  for (const [name, mod] of Object.entries(src.EXTRA_COMMANDS)) {
+    const triggers = mod.command?.triggers || mod.triggers;
+    const handler = mod.command?.handler || mod.handler;
+    if (!triggers || !handler) continue;
+    if (!mod.command) mod.command = { triggers, handler };
+    engine._modules[name] = { name, description: 'v4 extra', defaultCfg: {}, command: mod.command };
+    for (const t of triggers) {
+      engine.TRIGGER_MAP.set(t.toLowerCase(), engine._modules[name]);
+    }
   }
 }
+
+// Centralized FloodWait handling. teleproto auto-sleeps when
+// floodSleepThreshold > 0, but individual handlers should still surface
+// friendly errors. We export a helper for handlers to use.
+const { errors: tpErrors } = require('teleproto');
+function isFloodWait(e) { return e instanceof tpErrors.FloodWaitError || e?.seconds != null; }
 // Inject the engine ref into extras so hybrid/chain can resolve sub-commands.
 for (const mod of Object.values(extras.EXTRA_COMMANDS)) {
   if (typeof mod.handler === 'function') {
@@ -94,11 +102,8 @@ const adminIds = (process.env.AGENT_ADMIN_IDS || '')
   .map((s) => s.trim())
   .filter(Boolean);
 
-// aiMode is wrapped in a mutable container so the `mode` command can flip it
-// at runtime without restarting the bot. Read access goes through `aiModeRef.v`.
-const aiModeRef = { v: (process.env.AI_MODE || 'hybrid').toLowerCase() };
-if (!['on', 'off', 'hybrid'].includes(aiModeRef.v)) aiModeRef.v = 'hybrid';
-let aiMode = aiModeRef.v; // backward-compat: read once at startup for any code that still does `aiMode ===`
+let aiMode = (process.env.AI_MODE || 'hybrid').toLowerCase();
+if (!['on', 'off', 'hybrid'].includes(aiMode)) aiMode = 'hybrid';
 
 const sessionString =
   process.env.SESSION_STRING ||
@@ -131,16 +136,7 @@ const ctx = {
   channelConfig,
   downloadDir,
   automations,
-  aiMode: aiModeRef.v,   // snapshot at startup; updated live by mode command
-  aiModeRef,             // pass the live ref to engine command ctxs
-  setAiMode: (m) => {    // helper used by the mode command
-    if (['on', 'off', 'hybrid'].includes(m)) {
-      aiModeRef.v = m;
-      ctx.aiMode = m;
-      return true;
-    }
-    return false;
-  },
+  aiMode,
   _automationTimers: {},
   log: (...args) => console.log('[auto]', ...args),
 };
@@ -173,8 +169,7 @@ function loadProviders() {
       name: 'groq',
       baseUrl: 'https://api.groq.com/openai/v1',
       apiKey: process.env.GROQ_API_KEY,
-      // Default updated away from llama-3.3-70b-versatile (deprecated, EOL 2026-08-16)
-      model: process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
+      model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
       format: 'openai',
     });
   }
@@ -208,11 +203,9 @@ function loadProviders() {
   if (process.env.GITHUB_TOKEN) {
     shortcuts.push({
       name: 'github',
-      // Old azure endpoint (models.inference.ai.azure.com) was deprecated 2025-07-17
-      // and removed 2025-10-17. Use the new GitHub-native endpoint.
-      baseUrl: 'https://models.github.ai/inference',
+      baseUrl: 'https://models.inference.ai.azure.com',
       apiKey: process.env.GITHUB_TOKEN,
-      model: process.env.GITHUB_MODEL || 'openai/gpt-4o',
+      model: process.env.GITHUB_MODEL || 'gpt-4o',
       format: 'openai',
     });
   }
@@ -220,7 +213,7 @@ function loadProviders() {
 }
 
 const providers = loadProviders();
-const aiEnabled = providers.length > 0 && aiModeRef.v !== 'off';
+const aiEnabled = providers.length > 0 && aiMode !== 'off';
 if (aiEnabled) {
   console.log('LLM providers:', providers.map((p) => `${p.name}:${p.model}`).join(', '));
 } else if (providers.length === 0) {
@@ -228,47 +221,11 @@ if (aiEnabled) {
 } else {
   console.log('AI disabled by AI_MODE=off — running in commands-only mode.');
 }
-console.log(`AI mode: ${aiModeRef.v}`);
+console.log(`AI mode: ${aiMode}`);
 console.log(`Automations: ${Object.entries(automations).filter(([, v]) => v?.enabled).map(([k]) => k).join(', ') || '(none enabled)'}`);
 
 const conversations = new Map();
 const reminders = [];
-
-// ──────────────────────────────────────────────────────────────────────────
-// Bot commands menu (MTProto: bots.setBotCommands)
-// Shows a clean /command list in Telegram's "/" dropdown for users.
-// ──────────────────────────────────────────────────────────────────────────
-
-const BOT_COMMANDS_MENU = [
-  { command: 'help',     description: 'Show all commands' },
-  { command: 'tools',    description: 'List LLM tools' },
-  { command: 'automations', description: 'Show automation status' },
-  { command: 'mode',     description: 'AI mode: on | off | hybrid' },
-  { command: 'health',   description: 'Bot health snapshot' },
-  { command: 'ping',     description: 'Latency check' },
-  { command: 'id',       description: 'Chat / msg / sender ids' },
-  { command: 'whoami',   description: 'Your id + admin status' },
-  { command: 'reset',    description: 'Clear DM chat history' },
-  { command: 'menu',     description: 'Refresh bot commands menu' },
-];
-
-async function registerBotCommandsMenu(client) {
-  // bots.setBotCommands is bot-only. User accounts (userbot) get USER_BOT_REQUIRED.
-  // We detect user accounts up front so the startup log stays clean and the
-  // /menu command can return a friendly "bot-only" message instead of an error.
-  if (!client || !Api) throw new Error('client/Api not ready');
-  let me;
-  try { me = await client.getMe(); } catch (e) { throw new Error('getMe failed: ' + e.message); }
-  if (me && me.bot === false) {
-    throw Object.assign(new Error('bots.setBotCommands is bot-only; this is a user account'), { code: 'USER_BOT_REQUIRED' });
-  }
-  const commands = BOT_COMMANDS_MENU.map((c) => new Api.BotCommand({ command: c.command, description: c.description }));
-  await client.invoke(new Api.bots.setBotCommands({
-    scope: new Api.BotCommandScopeDefault(),
-    langCode: '',
-    commands,
-  }));
-}
 
 // ──────────────────────────────────────────────────────────────────────────
 // Conversation history helpers
@@ -331,16 +288,8 @@ AI mode: ${aiMode}`;
 
 function runSlashBuiltin(client, msg, command, args, isAdmin) {
   switch (command) {
-    case 'help': {
-      // Use the v3 extras help (same as no-prefix `help`) so /help and help
-      // show the same content. Includes env editing, reply-media, hybrid/chain.
-      const helpMod = extras.EXTRA_COMMANDS.help;
-      if (helpMod?.handler) {
-        const out = helpMod.handler({ chatId: String(msg.chatId), aiMode: aiModeRef.v, aiModeRef }, []);
-        return out || SLASH_HELP;
-      }
+    case 'help':
       return SLASH_HELP;
-    }
     case 'tools': {
       if (!aiEnabled) return 'AI disabled — no LLM tools available.';
       const names = ALL_TOOL_NAMES.join(', ');
@@ -353,54 +302,6 @@ function runSlashBuiltin(client, msg, command, args, isAdmin) {
       return 'Cleared. Fresh start.';
     case 'ping':
       return `pong — ${new Date().toISOString()}`;
-    case 'uptime': {
-      const s = process.uptime();
-      const h = Math.floor(s / 3600); const m = Math.floor((s % 3600) / 60); const sec = Math.floor(s % 60);
-      return `uptime: ${h}h ${m}m ${sec}s`;
-    }
-    case 'id': {
-      const senderId = String(msg.senderId || msg.fromId?.userId || '');
-      return [
-        `chat: ${msg.chatId}`,
-        `msg: ${msg.id}`,
-        `sender: ${senderId || '?'}`,
-        `isPrivate: ${!!msg.isPrivate}`,
-        `isChannel: ${!!msg.isChannel}`,
-        `isGroup: ${!!msg.isGroup}`,
-      ].join('\n');
-    }
-    case 'health': {
-      const enabled = Object.entries(automations).filter(([, v]) => v?.enabled).map(([k]) => k);
-      const mem = process.memoryUsage();
-      return [
-        `mode: ${aiModeRef.v}`,
-        `uptime: ${process.uptime().toFixed(0)}s`,
-        `mem: rss ${(mem.rss / 1024 / 1024).toFixed(1)}MB / heap ${(mem.heapUsed / 1024 / 1024).toFixed(1)}MB`,
-        `automations: ${enabled.length} enabled (${enabled.join(', ') || 'none'})`,
-        `node: ${process.version}`,
-      ].join('\n');
-    }
-    case 'stats': {
-      const m = process.memoryUsage();
-      return [
-        `modules: ${Object.keys(require.cache).length} cached`,
-        `heap: ${(m.heapUsed / 1024 / 1024).toFixed(2)}MB used / ${(m.heapTotal / 1024 / 1024).toFixed(2)}MB total`,
-        `rss: ${(m.rss / 1024 / 1024).toFixed(2)}MB`,
-        `external: ${(m.external / 1024 / 1024).toFixed(2)}MB`,
-        `pid: ${process.pid}`,
-        `node: ${process.version}`,
-      ].join('\n');
-    }
-    case 'menu': {
-      // Re-publish the bot commands menu on demand.
-      if (!isAdmin) return 'admin-only';
-      // Fire-and-forget; reply "menu scheduled" since the actual call is async.
-      registerBotCommandsMenu(client).then(
-        () => ctx.log('commands menu refreshed via /menu'),
-        (e) => ctx.log('commands menu refresh failed: ' + e.message)
-      );
-      return 'menu refresh scheduled';
-    }
     case 'whoami': {
       const senderId = String(msg.senderId || msg.fromId?.userId || '');
       return `Your Telegram ID: ${senderId}\nAdmin: ${adminIds.includes(senderId) ? 'yes' : 'no'}`;
@@ -467,8 +368,10 @@ async function execTelegramTool(client, name, args, tctx) {
     }
     case 'set_typing': {
       try {
+        const { resolveInputPeer } = require('./peer');
+        const peer = await resolveInputPeer(client, args.chat);
         await client.invoke(new Api.messages.SetTyping({
-          peer: args.chat, action: new Api.SendMessageTypingAction(),
+          peer, action: new Api.SendMessageTypingAction(),
         }));
       } catch {}
       return { ok: true };
@@ -529,8 +432,10 @@ async function execTelegramTool(client, name, args, tctx) {
       const gate = ensureChannel(args.channel, 'canReact');
       if (gate.error) return gate;
       try {
+        const { resolveInputPeer } = require('./peer');
+        const peer = await resolveInputPeer(client, args.channel);
         await client.invoke(new Api.messages.SendReaction({
-          peer: args.channel, msgId: args.messageId,
+          peer, msgId: args.messageId,
           reaction: [new Api.ReactionEmoji({ emoticon: args.emoji })],
         }));
         return { ok: true };
@@ -562,8 +467,10 @@ async function execTelegramTool(client, name, args, tctx) {
       const gate = ensureChannel(args.channel, 'canPin');
       if (gate.error) return gate;
       try {
+        const { resolveInputPeer } = require('./peer');
+        const peer = await resolveInputPeer(client, args.channel);
         await client.invoke(new Api.messages.UpdatePinnedMessage({
-          peer: args.channel, id: args.messageId, unpin: name === 'unpin_message',
+          peer, id: args.messageId, unpin: name === 'unpin_message',
         }));
         return { ok: true };
       } catch (e) { return { error: e.message }; }
@@ -981,7 +888,7 @@ async function tryAutomationCommand(client, msg, isAdmin, text) {
   if (!isAdmin) return null;
   try {
     const reply = await automation.command.handler(
-      { client, chatId: msg.chatId, automations, adminIds, channelConfig, downloadDir, aiMode, aiModeRef, setAiMode: ctx.setAiMode, log: ctx.log, _automationTimers: ctx._automationTimers },
+      { client, chatId: msg.chatId, automations, adminIds, channelConfig, downloadDir, aiMode, log: ctx.log, _automationTimers: ctx._automationTimers },
       resolved.args
     );
     if (reply != null) {
@@ -1007,7 +914,7 @@ async function tryExtrasCommand(client, msg, isAdmin, text) {
   if (!isAdmin) return null;
   try {
     const reply = await trigger.command.handler(
-      { client, msg, Api, chatId: msg.chatId, automations, adminIds, channelConfig, downloadDir, aiMode, aiModeRef, setAiMode: ctx.setAiMode, engine, log: ctx.log, _automationTimers: ctx._automationTimers },
+      { client, msg, Api, chatId: msg.chatId, automations, adminIds, channelConfig, downloadDir, aiMode, engine, log: ctx.log, _automationTimers: ctx._automationTimers },
       resolved.args
     );
     if (reply != null) {
@@ -1061,13 +968,15 @@ async function handleMessage(client, msg) {
 
   // ── Phase 3: AI agent
   // Only in DMs (original behavior) and only if AI is enabled.
-  if (aiModeRef.v === 'off') return; // commands-only mode (live, togglable by `mode` command)
+  if (aiMode === 'off') return; // commands-only mode
   if (!msg.isPrivate) return; // original: DMs only
   if (!aiEnabled) return;
 
   // Show typing
   try {
-    await client.invoke(new Api.messages.SetTyping({ peer: msg.chatId, action: new Api.SendMessageTypingAction() }));
+    const { resolveInputPeer } = require('./peer');
+    const peer = await resolveInputPeer(client, msg.chatId);
+    await client.invoke(new Api.messages.SetTyping({ peer, action: new Api.SendMessageTypingAction() }));
   } catch {}
 
   let reply;
@@ -1129,23 +1038,10 @@ async function start() {
   else console.log('WARNING: AGENT_ADMIN_IDS is empty.');
 
   ctx.client = client;
-
-  // Publish the bot commands menu so Telegram's "/" dropdown shows a clean list.
-  // For user accounts (this whole bot IS a userbot) bots.setBotCommands is
-  // rejected with USER_BOT_REQUIRED — that's expected and harmless. The `menu`
-  // no-prefix/slash command is the user-facing way to ask; it returns a clear
-  // message instead of an MTProto error.
-  if (me && me.bot) {
-    try {
-      await registerBotCommandsMenu(client);
-      console.log(`Bot commands menu published (${BOT_COMMANDS_MENU.length} commands).`);
-    } catch (e) {
-      console.warn('Failed to publish bot commands menu:', e.message);
-    }
-  } else {
-    console.log('User account detected — skipping bots.setBotCommands (bot-only API).');
-    console.log('Use the `menu` command in chat to see the commands list instead.');
-  }
+  // Inject the safe peer resolver so automations (autolike, autoreact,
+  // autoread, autotyping) never throw the "Ambiguous type InputPeer" error.
+  const { resolveInputPeer } = require('./peer');
+  ctx._resolveInputPeer = (peer) => resolveInputPeer(client, peer);
 
   // Initialize automations that have init() (e.g. autobio, antiraid, scheduler)
   ctx._automationHooks = {};
